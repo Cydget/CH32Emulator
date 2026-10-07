@@ -201,6 +201,7 @@ version = "0.1.0"
 dependencies = [
  "ch32-hal",
  "embassy-executor",
+ "embassy-futures",
  "embassy-time",
  "panic-halt",
  "qingke",

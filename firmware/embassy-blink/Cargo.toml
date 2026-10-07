@@ -10,8 +10,10 @@ ch32-hal = { git = "https://github.com/ch32-rs/ch32-hal", features = [
     "memory-x",
     "embassy",
     "rt",
+    "exti",
     "time-driver-tim2",
 ], default-features = false }
+embassy-futures = "0.1"
 embassy-time = "0.5"
 embassy-executor = { version = "0.10", features = [
     "platform-riscv32",

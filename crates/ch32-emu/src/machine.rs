@@ -32,6 +32,18 @@ const TIM_BASES: [u32; 3] = [0x4000_0000, 0x4000_0400, 0x4000_0800];
 const TIM_IRQS: [u32; 3] = [IRQ_TIM2, IRQ_TIM3, IRQ_TIM4];
 const RCC_BASE: u32 = 0x4002_1000;
 const USART1_BASE: u32 = 0x4001_3800;
+const AFIO_BASE: u32 = 0x4001_0000;
+const EXTI_BASE: u32 = 0x4001_0400;
+/// EXTI lines 0–4 have their own IRQ. Lines 5–9 share EXTI9_5, lines 10–15 share EXTI15_10.
+const EXTI_IRQS: [(u32, u32); 7] = [
+    (22, 1 << 0),
+    (23, 1 << 1),
+    (24, 1 << 2),
+    (25, 1 << 3),
+    (26, 1 << 4),
+    (39, 0x03e0),
+    (56, 0xfc00),
+];
 const SPI_BASES: [u32; 2] = [0x4001_3000, 0x4000_3800];
 const SPI_IRQS: [u32; 2] = [51, 52];
 const I2C_BASES: [u32; 2] = [0x4000_5400, 0x4000_5800];
@@ -661,6 +673,82 @@ impl Usart {
     }
 }
 
+/// AFIO external-interrupt port select. Four registers, one nibble per line.
+#[derive(Clone, Copy, Debug)]
+struct Afio {
+    exti_cr: [u32; 4],
+}
+
+impl Afio {
+    fn new() -> Self {
+        Self { exti_cr: [0; 4] }
+    }
+
+    /// Port number (0 = A) wired to this EXTI line. Reset value selects port A.
+    fn port(&self, line: u8) -> u8 {
+        let line = u32::from(line & 15);
+        let reg = self.exti_cr[(line / 4) as usize];
+        ((reg >> ((line % 4) * 4)) & 0xf) as u8
+    }
+}
+
+/// EXTI pending and trigger registers. An edge sets INTFR; INTENR gates the IRQ line.
+#[derive(Clone, Copy, Debug)]
+struct Exti {
+    intenr: u32,
+    evenr: u32,
+    rtenr: u32,
+    ftenr: u32,
+    swievr: u32,
+    intfr: u32,
+}
+
+impl Exti {
+    fn new() -> Self {
+        Self {
+            intenr: 0,
+            evenr: 0,
+            rtenr: 0,
+            ftenr: 0,
+            swievr: 0,
+            intfr: 0,
+        }
+    }
+
+    fn read(&self, offset: u32) -> u32 {
+        match offset {
+            0x00 => self.intenr,
+            0x04 => self.evenr,
+            0x08 => self.rtenr,
+            0x0c => self.ftenr,
+            0x10 => self.swievr,
+            0x14 => self.intfr,
+            _ => 0,
+        }
+    }
+
+    fn write(&mut self, offset: u32, value: u32) {
+        match offset {
+            0x00 => self.intenr = value,
+            0x04 => self.evenr = value,
+            0x08 => self.rtenr = value,
+            0x0c => self.ftenr = value,
+            // A 1 in SWIEVR raises the pending flag, the same as a pin edge.
+            0x10 => {
+                self.swievr = value;
+                self.intfr |= value;
+            }
+            // INTFR is write-1-to-clear.
+            0x14 => self.intfr &= !value,
+            _ => {}
+        }
+    }
+
+    fn irq_asserted(&self, mask: u32) -> bool {
+        self.intfr & self.intenr & mask != 0
+    }
+}
+
 enum Link {
     Spi {
         bus: usize,
@@ -821,6 +909,8 @@ struct Undo {
     usart_tx: Option<Vec<u8>>,
     spi: [Spi; 2],
     i2c: [I2c; 2],
+    afio: Afio,
+    exti: Exti,
     /// Attached components before this instruction, kept only when the instruction touched one.
     devices: Option<Vec<Attached>>,
     pfic_enable: [u32; 8],
@@ -845,6 +935,10 @@ pub struct Machine {
     usart1: Usart,
     spi: [Spi; 2],
     i2c: [I2c; 2],
+    afio: Afio,
+    exti: Exti,
+    /// Last sampled electrical high for each pin, so a drive can be seen as an edge.
+    pin_high: [[bool; 16]; 4],
     devices: Vec<Attached>,
     device_backup: Option<Vec<Attached>>,
     next_device: u32,
@@ -881,6 +975,9 @@ impl Machine {
             usart1: Usart::new(),
             spi: [Spi::new(); 2],
             i2c: [I2c::new(); 2],
+            afio: Afio::new(),
+            exti: Exti::new(),
+            pin_high: [[false; 16]; 4],
             devices: Vec::new(),
             device_backup: None,
             next_device: 0,
@@ -934,6 +1031,8 @@ impl Machine {
         self.usart1 = Usart::new();
         self.spi = [Spi::new(); 2];
         self.i2c = [I2c::new(); 2];
+        self.afio = Afio::new();
+        self.exti = Exti::new();
         self.uart_tx.clear();
         self.faults.clear();
         for (addr, data) in segments {
@@ -956,6 +1055,7 @@ impl Machine {
             }
         }
         self.update_chip_selects();
+        self.sample_pin_levels();
     }
 
     pub fn step(&mut self) -> Result<(), Fault> {
@@ -1286,6 +1386,9 @@ impl Machine {
         self.usart1.rx = undo.usart_rx;
         self.spi = undo.spi;
         self.i2c = undo.i2c;
+        self.afio = undo.afio;
+        self.exti = undo.exti;
+        self.sample_pin_levels();
         if let Some(devices) = undo.devices {
             self.devices = devices;
         }
@@ -1342,6 +1445,8 @@ impl Machine {
             },
             spi: self.spi,
             i2c: self.i2c,
+            afio: self.afio,
+            exti: self.exti,
             devices: None,
             pfic_enable: self.pfic.enable,
             pfic_pending: self.pfic.pending,
@@ -1459,7 +1564,7 @@ impl Machine {
     }
 
     /// Level of every peripheral interrupt line the model drives.
-    fn irq_lines(&self) -> [(u32, bool); 11] {
+    fn irq_lines(&self) -> [(u32, bool); 18] {
         [
             (self.timers[0].irq, self.timers[0].irq_asserted()),
             (self.timers[1].irq, self.timers[1].irq_asserted()),
@@ -1472,7 +1577,57 @@ impl Machine {
             (I2C_EV_IRQS[1], self.i2c[1].ev_irq()),
             (I2C_ER_IRQS[1], self.i2c[1].er_irq()),
             (IRQ_USART1, self.usart1.irq_asserted()),
+            (EXTI_IRQS[0].0, self.exti.irq_asserted(EXTI_IRQS[0].1)),
+            (EXTI_IRQS[1].0, self.exti.irq_asserted(EXTI_IRQS[1].1)),
+            (EXTI_IRQS[2].0, self.exti.irq_asserted(EXTI_IRQS[2].1)),
+            (EXTI_IRQS[3].0, self.exti.irq_asserted(EXTI_IRQS[3].1)),
+            (EXTI_IRQS[4].0, self.exti.irq_asserted(EXTI_IRQS[4].1)),
+            (EXTI_IRQS[5].0, self.exti.irq_asserted(EXTI_IRQS[5].1)),
+            (EXTI_IRQS[6].0, self.exti.irq_asserted(EXTI_IRQS[6].1)),
         ]
+    }
+
+    fn afio_exti_read(&self, addr: u32) -> Option<u32> {
+        if (AFIO_BASE..AFIO_BASE + 0x400).contains(&addr) {
+            let offset = addr - AFIO_BASE;
+            if (0x08..0x18).contains(&offset) {
+                return Some(self.afio.exti_cr[((offset - 0x08) / 4) as usize]);
+            }
+        }
+        if (EXTI_BASE..EXTI_BASE + 0x400).contains(&addr) {
+            return Some(self.exti.read(addr - EXTI_BASE));
+        }
+        None
+    }
+
+    fn sample_pin_levels(&mut self) {
+        for port in 0..4 {
+            for pin in 0..16u8 {
+                self.pin_high[port][pin as usize] = self.gpio[port].input_bit(pin);
+            }
+        }
+    }
+
+    /// Set EXTI pending bits for pins whose electrical level just rose or fell.
+    fn note_pin_edges(&mut self) {
+        let mut hit = 0u32;
+        for port in 0..4 {
+            for pin in 0..16u8 {
+                let high = self.gpio[port].input_bit(pin);
+                let was = self.pin_high[port][pin as usize];
+                self.pin_high[port][pin as usize] = high;
+                if high == was || self.afio.port(pin) != port as u8 {
+                    continue;
+                }
+                let mask = 1u32 << pin;
+                let rise = high && (self.exti.rtenr & mask) != 0;
+                let fall = !high && (self.exti.ftenr & mask) != 0;
+                if rise || fall {
+                    hit |= mask;
+                }
+            }
+        }
+        self.exti.intfr |= hit;
     }
 
     pub fn pin(&self, port: usize, pin: u8) -> PinView {
@@ -1509,6 +1664,7 @@ impl Machine {
             self.gpio[port].analog_v[pin as usize] = analog_v;
             self.now = self.cpu.cycle;
             self.update_chip_selects();
+            self.note_pin_edges();
         }
     }
 
@@ -1606,6 +1762,9 @@ impl Machine {
             if (base..base + 0x400).contains(&addr) {
                 return Some(self.timers[i].read(addr - base));
             }
+        }
+        if let Some(word) = self.afio_exti_read(addr) {
+            return Some(word);
         }
         if (RCC_BASE..RCC_BASE + 0x40).contains(&addr) {
             let mut rcc = self.rcc;
@@ -1755,6 +1914,9 @@ impl Machine {
                 return Some(self.timers[i].read(addr - base));
             }
         }
+        if let Some(word) = self.afio_exti_read(addr) {
+            return Some(word);
+        }
         if (RCC_BASE..RCC_BASE + 0x40).contains(&addr) {
             self.rcc.sync();
             return Some(self.rcc.regs[((addr - RCC_BASE) / 4) as usize]);
@@ -1803,8 +1965,21 @@ impl Machine {
             if (base..base + 0x400).contains(&addr) {
                 self.gpio[i].write(addr - base, val);
                 self.update_chip_selects();
+                self.note_pin_edges();
                 return true;
             }
+        }
+        if (AFIO_BASE..AFIO_BASE + 0x400).contains(&addr) {
+            let offset = addr - AFIO_BASE;
+            if (0x08..0x18).contains(&offset) {
+                self.afio.exti_cr[((offset - 0x08) / 4) as usize] = val;
+                return true;
+            }
+            return false;
+        }
+        if (EXTI_BASE..EXTI_BASE + 0x400).contains(&addr) {
+            self.exti.write(addr - EXTI_BASE, val);
+            return true;
         }
         for (i, &base) in SPI_BASES.iter().enumerate() {
             if (base..base + 0x400).contains(&addr) {
@@ -1878,7 +2053,11 @@ impl Machine {
                     self.usart1 = Usart::new();
                     self.usart1.tx = tx;
                 }
+                if val & 1 != 0 {
+                    self.afio = Afio::new();
+                }
                 self.update_chip_selects();
+                self.note_pin_edges();
             }
             self.rcc.regs[idx] = val;
             self.rcc.sync();
@@ -1953,6 +2132,7 @@ impl Machine {
         for bus in 0..2 {
             out.push(self.i2c_view(bus));
         }
+        out.push(self.exti_view());
         out.push(self.pfic_view());
         for attached in &self.devices {
             out.push(self.device_view(attached));
@@ -2658,6 +2838,73 @@ impl Machine {
         }
     }
 
+    fn exti_view(&self) -> PeripheralView {
+        let mut inputs = vec![
+            signal(
+                "INTENR",
+                Some(EXTI_BASE),
+                format!("{:#010x}", self.exti.intenr),
+            ),
+            signal(
+                "RTENR",
+                Some(EXTI_BASE + 0x08),
+                format!("{:#010x}", self.exti.rtenr),
+            ),
+            signal(
+                "FTENR",
+                Some(EXTI_BASE + 0x0c),
+                format!("{:#010x}", self.exti.ftenr),
+            ),
+        ];
+        let armed = self.exti.intenr | self.exti.rtenr | self.exti.ftenr | self.exti.intfr;
+        for line in 0..16u8 {
+            if armed & (1 << line) == 0 {
+                continue;
+            }
+            let port = self.afio.port(line);
+            let high = self
+                .gpio
+                .get(port as usize)
+                .is_some_and(|g| g.input_bit(line));
+            inputs.push(signal(
+                format!("line {line}"),
+                Some(AFIO_BASE + 0x08 + u32::from(line / 4) * 4),
+                format!(
+                    "{}{} is {}, rising {}, falling {}",
+                    b"ABCD".get(port as usize).copied().unwrap_or(b'?') as char,
+                    line,
+                    if high { "high" } else { "low" },
+                    u8::from(self.exti.rtenr & (1 << line) != 0),
+                    u8::from(self.exti.ftenr & (1 << line) != 0)
+                ),
+            ));
+        }
+        let pending: Vec<String> = (0..16u8)
+            .filter(|line| self.exti.intfr & (1 << line) != 0)
+            .map(|line| format!("line {line}"))
+            .collect();
+        let action = if pending.is_empty() {
+            "No EXTI line is pending. A rising or falling edge on the pin selected in AFIO EXTICR sets INTFR when that edge is enabled.".to_string()
+        } else {
+            format!(
+                "Pending: {}. The interrupt handler clears INTFR by writing those bits as 1, and ch32-hal also clears INTENR for them.",
+                pending.join(", ")
+            )
+        };
+        PeripheralView {
+            id: "EXTI".into(),
+            group: "EXTI".into(),
+            action,
+            inputs,
+            outputs: vec![signal(
+                "INTFR",
+                Some(EXTI_BASE + 0x14),
+                format!("{:#010x}", self.exti.intfr),
+            )],
+            effects: Vec::new(),
+        }
+    }
+
     fn pfic_view(&self) -> PeripheralView {
         let mut next = self.pfic.clone();
         for (irq, asserted) in self.irq_lines() {
@@ -2859,6 +3106,13 @@ fn irq_label(irq: u32) -> String {
         51 => "SPI1".into(),
         52 => "SPI2".into(),
         IRQ_USART1 => "USART1".into(),
+        22 => "EXTI0".into(),
+        23 => "EXTI1".into(),
+        24 => "EXTI2".into(),
+        25 => "EXTI3".into(),
+        26 => "EXTI4".into(),
+        39 => "EXTI9_5".into(),
+        56 => "EXTI15_10".into(),
         other => format!("IRQ{other}"),
     }
 }
@@ -3163,6 +3417,111 @@ mod tests {
         assert_eq!(m.cpu.cycle, 2);
         assert_eq!(m.gpio[0].external[0], ExternalDrive::High);
         assert_eq!(m.gpio[0].analog_v[0], 1.5);
+    }
+
+    #[test]
+    fn rising_edge_on_pb1_interrupts_and_toggles_pa14() {
+        let mut m = Machine::new();
+        // IRQ 23 vector, a wait loop, and a handler that toggles PA14 then returns.
+        let handler = FLASH_BASE + 0x100;
+        let wait = FLASH_BASE + 0x80;
+        m.store32(FLASH_BASE + 23 * 4, handler).unwrap();
+        let wait_code = [
+            0x1050_0073u32, // wfi
+            0xffdf_f06f,    // jal x0, -4
+        ];
+        let handler_code = [
+            0x4001_0237, // lui x4, 0x40010
+            0x4142_0213, // addi x4, x4, 0x414 -> EXTI INTFR
+            0x0020_0293, // addi x5, x0, 2
+            0x0052_2023, // sw x5, 0(x4)      clear line 1
+            0x4001_10b7, // lui x1, 0x40011
+            0x8000_8093, // addi x1, x1, -2048 -> GPIOA
+            0x00c0_a103, // lw x2, 12(x1)
+            0x0000_41b7, // lui x3, 4 -> bit 14
+            0x0031_4133, // xor x2, x2, x3
+            0x0020_a623, // sw x2, 12(x1)
+            0x3020_0073, // mret
+        ];
+        for (i, word) in wait_code.iter().enumerate() {
+            m.store32(wait + i as u32 * 4, *word).unwrap();
+        }
+        for (i, word) in handler_code.iter().enumerate() {
+            m.store32(handler + i as u32 * 4, *word).unwrap();
+        }
+        // PA14 push-pull output. PB1 input with pull-up, so it idles high.
+        m.store32(0x4001_0804, (0x4444_4444 & !(0xf << 24)) | (0x2 << 24))
+            .unwrap();
+        m.store32(0x4001_0c00, (0x4444_4444 & !(0xf << 4)) | (0x8 << 4))
+            .unwrap();
+        m.store32(0x4001_0c0c, 1 << 1).unwrap();
+        m.store32(AFIO_BASE + 0x08, 1 << 4).unwrap();
+        m.store32(EXTI_BASE + 0x08, 1 << 1).unwrap();
+        m.store32(EXTI_BASE, 1 << 1).unwrap();
+        m.store32(PFIC_BASE + 0x100, 1 << 23).unwrap();
+        m.cpu.mtvec = FLASH_BASE | 3;
+        m.cpu.mstatus |= 0x8;
+        m.cpu.pc = wait;
+
+        m.set_external(1, 1, ExternalDrive::Low, 0.0);
+        assert_eq!(
+            m.exti.intfr & (1 << 1),
+            0,
+            "driving low is not a rising edge"
+        );
+        m.set_external(1, 1, ExternalDrive::High, 0.0);
+        assert_ne!(m.exti.intfr & (1 << 1), 0, "INTFR line 1");
+        for _ in 0..12 {
+            m.step().unwrap();
+        }
+        assert_eq!(m.pin(0, 14).level, PinLevel::High);
+        assert_eq!(m.cpu.irqs_taken, 1);
+    }
+
+    #[test]
+    fn firmware_pb1_rising_edge_toggles_pa14() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../firmware/embassy-blink/target/riscv32imc-unknown-none-elf/release/embassy-blink"
+        );
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let loaded = crate::elf::load_elf(&bytes).expect("elf");
+        let segs: Vec<(u32, &[u8])> = loaded
+            .segments
+            .iter()
+            .map(|s| (s.address, s.data.as_slice()))
+            .collect();
+        let mut m = Machine::new();
+        m.load_image(&bytes, loaded.entry, &segs);
+        let mut armed = false;
+        let mut steps = 0u32;
+        for _ in 0..6_000_000 {
+            m.step().unwrap();
+            steps += 1;
+            if m.exti.intenr & (1 << 1) != 0 {
+                armed = true;
+                break;
+            }
+        }
+        assert!(armed, "EXTI line 1 was never armed after {steps} steps");
+        assert_eq!(m.pin(0, 14).level, PinLevel::Low);
+        m.set_external(1, 1, ExternalDrive::Low, 0.0);
+        for _ in 0..1_000 {
+            m.step().unwrap();
+        }
+        assert_eq!(m.pin(0, 14).level, PinLevel::Low);
+        m.set_external(1, 1, ExternalDrive::High, 0.0);
+        let mut toggled = false;
+        for _ in 0..400_000 {
+            m.step().unwrap();
+            if m.pin(0, 14).level == PinLevel::High {
+                toggled = true;
+                break;
+            }
+        }
+        assert!(toggled, "PA14 stayed low after a rising edge on PB1");
     }
 
     use crate::devices::{Component, DeviceCtx, DeviceView, I2cDevice, SimAdc, UartDevice};
