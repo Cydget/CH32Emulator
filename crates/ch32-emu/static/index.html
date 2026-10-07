@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CH32 emulator</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <strong>CH32V203C8T6</strong>
+      <span id="status">connecting</span>
+    </div>
+    <div class="controls">
+      <label class="file">
+        Load ELF
+        <input id="elf" type="file" accept=".elf,application/octet-stream">
+      </label>
+      <button id="run" type="button">Run</button>
+      <button id="pause" type="button">Pause</button>
+      <button id="step" type="button">Step</button>
+      <button id="reset" type="button">Reset</button>
+      <label>Speed
+        <select id="speed">
+          <option value="8000000" selected>8 MHz</option>
+          <option value="1000000">1 MHz</option>
+          <option value="100000">100 kHz</option>
+          <option value="0">Unlimited</option>
+        </select>
+      </label>
+    </div>
+  </header>
+  <main>
+    <section class="panel pins-panel">
+      <h2>Pins</h2>
+      <p class="hint">Click a pin to drive it high, low, or floating, or to set an analog voltage. Color follows the electrical level. The badge is the GPIO mode.</p>
+      <div id="ports"></div>
+      <div id="drive" class="drive" hidden>
+        <strong id="drive-title">PA0</strong>
+        <button type="button" data-level="high">Drive high</button>
+        <button type="button" data-level="low">Drive low</button>
+        <button type="button" data-level="float">Float</button>
+        <label>Analog <input id="analog" type="range" min="0" max="3.3" step="0.01" value="0"></label>
+        <span id="analog-readout">0.00 V</span>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>Core</h2>
+      <dl id="core"></dl>
+      <h2>UART1 TX</h2>
+      <pre id="uart"></pre>
+      <h2>Faults</h2>
+      <pre id="faults"></pre>
+    </section>
+    <section class="panel vars-panel">
+      <h2>Static variables</h2>
+      <p class="hint">Symbols in SRAM from the ELF. Checked variables are sampled while the core runs and drawn on the graph.</p>
+      <div id="symbols"></div>
+      <canvas id="graph" width="720" height="260"></canvas>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

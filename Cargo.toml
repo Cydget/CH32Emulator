@@ -1,0 +1,4 @@
+[workspace]
+resolver = "2"
+members = ["crates/ch32-emu"]
+exclude = ["firmware/embassy-blink"]
