@@ -25,6 +25,14 @@ const breakSymbol = document.querySelector("#break-symbol");
 const breakKind = document.querySelector("#break-kind");
 const breakValue = document.querySelector("#break-value");
 const breakValueLabel = document.querySelector("#break-value-label");
+const attachKind = document.querySelector("#attach-kind");
+const attachBus = document.querySelector("#attach-bus");
+const attachCs = document.querySelector("#attach-cs");
+const deviceSettings = document.querySelector("#device-settings");
+let periGroups = "";
+let kindsReady = false;
+let deviceCount = 0;
+let settingsFor = "";
 
 let socket;
 let latest = null;
@@ -94,6 +102,18 @@ periId.onchange = () => {
   if (!latest) return;
   renderPeripheral(latest.peripherals || []);
 };
+attachKind.onchange = () => fillAttachBuses();
+document.querySelector("#attach").onclick = () => {
+  send({ op: "attach", kind: attachKind.value, bus: attachBus.value, cs: attachCs.value.trim() });
+};
+deviceSettings.addEventListener("change", (event) => {
+  const input = event.target;
+  if (!input.dataset.key) return;
+  send({ op: "device_set", device: settingsFor, key: input.dataset.key, value: Number(input.value) });
+});
+deviceSettings.addEventListener("click", (event) => {
+  if (event.target.dataset.detach) send({ op: "detach", device: event.target.dataset.detach });
+});
 document.querySelector("#elf").onchange = async (event) => {
   const file = event.target.files[0];
   if (!file) return;
@@ -147,7 +167,9 @@ function render(snap) {
   renderSymbols(snap.symbols || []);
   drawGraph(snap.history || []);
   renderSpeed(snap);
+  renderAttach(snap.device_kinds || []);
   renderPeripheral(snap.peripherals || []);
+  renderDeviceSettings(snap.devices || []);
   const saved = Number(snap.undo) || 0;
   backBtn.disabled = saved === 0;
   backBtn.textContent = saved ? `Back (${saved})` : "Back";
@@ -216,18 +238,33 @@ function fillPeripherals(list) {
 
 function renderPeripheral(list) {
   if (!list.length) return;
-  if (!periMenuReady) {
-    const groups = [];
-    for (const item of list) {
-      if (!groups.includes(item.group)) groups.push(item.group);
-    }
+  const groups = [];
+  for (const item of list) {
+    if (!groups.includes(item.group)) groups.push(item.group);
+  }
+  const devices = list.filter((item) => item.group === "Devices");
+  const signature = list.map((item) => `${item.group}/${item.id}`).join(",");
+  if (signature !== periGroups) {
+    const previous = periGroup.value;
     periGroup.innerHTML = groups
       .map((group) => `<option value="${escapeHtml(group)}">${escapeHtml(group)}</option>`)
       .join("");
-    if (groups.includes("TIM")) periGroup.value = "TIM";
+    if (!periMenuReady) {
+      if (groups.includes("TIM")) periGroup.value = "TIM";
+    } else if (devices.length > deviceCount) {
+      periGroup.value = "Devices";
+    } else if (groups.includes(previous)) {
+      periGroup.value = previous;
+    }
     fillPeripherals(list);
-    if ([...periId.options].some((option) => option.value === "TIM2")) periId.value = "TIM2";
+    if (!periMenuReady && [...periId.options].some((option) => option.value === "TIM2")) {
+      periId.value = "TIM2";
+    } else if (devices.length > deviceCount && periGroup.value === "Devices") {
+      periId.value = devices[devices.length - 1].id;
+    }
     periMenuReady = true;
+    periGroups = signature;
+    deviceCount = devices.length;
   }
   const peripheral = list.find((item) => item.id === periId.value) || list[0];
   periAction.textContent = peripheral.action;
@@ -236,6 +273,50 @@ function renderPeripheral(list) {
   const outputs = peripheral.outputs || [];
   periOutputsWrap.hidden = outputs.length === 0;
   if (outputs.length) periOutputs.innerHTML = signalTable(outputs);
+}
+
+function renderAttach(kinds) {
+  if (kindsReady || !kinds.length) return;
+  attachKind.innerHTML = kinds
+    .map((k) => `<option value="${escapeHtml(k.kind)}">${escapeHtml(k.label)}</option>`)
+    .join("");
+  attachKind.dataset.buses = JSON.stringify(Object.fromEntries(kinds.map((k) => [k.kind, k.buses])));
+  fillAttachBuses();
+  kindsReady = true;
+}
+
+function fillAttachBuses() {
+  const buses = JSON.parse(attachKind.dataset.buses || "{}")[attachKind.value] || [];
+  attachBus.innerHTML = buses
+    .map((bus) => `<option value="${escapeHtml(bus)}">${escapeHtml(bus)}</option>`)
+    .join("");
+}
+
+function renderDeviceSettings(devices) {
+  const device = periGroup.value === "Devices" ? devices.find((d) => d.id === periId.value) : null;
+  if (!device) {
+    deviceSettings.hidden = true;
+    settingsFor = "";
+    return;
+  }
+  deviceSettings.hidden = false;
+  const keys = device.settings.map((s) => s.key).join(",");
+  if (settingsFor !== device.id || deviceSettings.dataset.keys !== keys) {
+    deviceSettings.innerHTML =
+      device.settings
+        .map(
+          (s) =>
+            `<label>${escapeHtml(s.label)} <input type="number" step="any" data-key="${escapeHtml(s.key)}" value="${s.value}"></label>`,
+        )
+        .join("") + `<button type="button" data-detach="${escapeHtml(device.id)}">Detach ${escapeHtml(device.id)}</button>`;
+    settingsFor = device.id;
+    deviceSettings.dataset.keys = keys;
+    return;
+  }
+  for (const s of device.settings) {
+    const input = deviceSettings.querySelector(`input[data-key="${s.key}"]`);
+    if (input && document.activeElement !== input) input.value = s.value;
+  }
 }
 
 function signalTable(rows) {

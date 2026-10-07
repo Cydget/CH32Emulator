@@ -91,7 +91,22 @@
         </div>
       </div>
       <p class="hint">Pick a peripheral from the menu. Inputs are the registers and signals it is using. Changes this step are what its next update will write. A register change shows the address, the old value, and the new value. That update is the peripheral's own step, separate from the instruction about to execute.</p>
+      <div class="attach-row">
+        <strong>Attach component</strong>
+        <label>Kind
+          <select id="attach-kind"></select>
+        </label>
+        <label>Bus
+          <select id="attach-bus"></select>
+        </label>
+        <label>Chip select
+          <input id="attach-cs" type="text" value="PA4" size="5" placeholder="none">
+        </label>
+        <button id="attach" type="button">Attach</button>
+      </div>
+      <p class="hint">Attached components show up under Devices. They answer the firmware on the bus they are wired to. A chip select pin selects the component while that GPIO reads low; leave it empty to keep it always selected.</p>
       <p id="peri-action"></p>
+      <div id="device-settings" class="device-settings" hidden></div>
       <div class="peri-columns">
         <div>
           <h3>Inputs</h3>

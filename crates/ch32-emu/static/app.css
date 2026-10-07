@@ -186,6 +186,17 @@ canvas {
   border-radius: 8px;
 }
 
+.attach-row, .device-settings {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 8px 0;
+}
+.attach-row input[type="text"] { width: 5em; }
+.device-settings label { display: flex; gap: 6px; align-items: center; font-size: 12px; }
+.device-settings input[type="number"] { width: 8em; }
+
 @media (max-width: 1100px) {
   main { grid-template-columns: 1fr; }
   .peri-columns { grid-template-columns: 1fr; }

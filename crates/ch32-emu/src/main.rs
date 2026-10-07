@@ -44,6 +44,10 @@ struct Cli {
     /// Guest cycles per second while running. 0 runs as fast as the host allows.
     #[arg(long, default_value_t = 8_000_000)]
     hz: u64,
+    /// Attach a simulated component, as BUS:KIND or BUS:KIND:CS. Repeatable.
+    /// Example: `--attach spi1:adc:PA4` wires the example ADC to SPI1 with chip select on PA4.
+    #[arg(long, value_name = "BUS:KIND[:CS]")]
+    attach: Vec<String>,
 }
 
 struct Session {
@@ -90,6 +94,18 @@ fn main() {
         status: "idle".into(),
     };
     session.machine.cpu.trace = cli.trace;
+    for spec in &cli.attach {
+        let mut parts = spec.splitn(3, ':');
+        let bus = parts.next().unwrap_or_default();
+        let kind = parts.next().unwrap_or_default();
+        match session.machine.attach_kind(bus, kind, parts.next()) {
+            Ok(id) => println!("attached {id} to {}", bus.to_ascii_uppercase()),
+            Err(err) => {
+                eprintln!("--attach {spec}: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
     if let Some(path) = &cli.elf {
         match std::fs::read(path) {
             Ok(bytes) => load_elf_bytes(&mut session, &bytes),
@@ -271,11 +287,18 @@ fn sample(session: &mut Session) {
 
 fn watched(watches: &[String], symbol: &StaticSymbol) -> bool {
     if watches.is_empty() {
-        return symbol.demangled.contains("BLINK_COUNT") || symbol.name.contains("BLINK_COUNT");
+        return default_watch(symbol);
     }
     watches
         .iter()
         .any(|w| w == &symbol.demangled || w == &symbol.name || symbol.demangled.contains(w))
+}
+
+/// Statics graphed before the user picks any: the blink counter and the SPI ADC example's channel 0.
+fn default_watch(symbol: &StaticSymbol) -> bool {
+    ["BLINK_COUNT", "ADC_CH0_MV"]
+        .iter()
+        .any(|name| symbol.demangled.contains(name) || symbol.name.contains(name))
 }
 
 fn load_elf_bytes(session: &mut Session, bytes: &[u8]) {
@@ -299,9 +322,7 @@ fn load_elf_bytes(session: &mut Session, bytes: &[u8]) {
                 session.watches = session
                     .symbols
                     .iter()
-                    .filter(|s| {
-                        s.demangled.contains("BLINK_COUNT") || s.name.contains("BLINK_COUNT")
-                    })
+                    .filter(|s| default_watch(s))
                     .map(|s| s.demangled.clone())
                     .collect();
             }
@@ -437,6 +458,11 @@ fn snapshot(session: &Session) -> Value {
             "value": bp.value,
         })),
         "peripherals": session.machine.peripherals(),
+        "devices": session.machine.devices(),
+        "device_kinds": ch32_emu::devices::KINDS
+            .iter()
+            .map(|(kind, label, buses)| json!({"kind": kind, "label": label, "buses": buses}))
+            .collect::<Vec<_>>(),
         "pc": cpu.pc,
         "cycles": cpu.cycle,
         "mstatus": cpu.mstatus,
@@ -533,6 +559,18 @@ struct Command {
     break_kind: Option<String>,
     #[serde(default)]
     break_value: Option<i64>,
+    #[serde(default)]
+    bus: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    cs: Option<String>,
+    #[serde(default)]
+    device: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    value: Option<f64>,
 }
 
 fn apply(session: &mut Session, cmd: Command) {
@@ -659,6 +697,31 @@ fn apply(session: &mut Session, cmd: Command) {
                 .machine
                 .set_external(index, pin, drive, cmd.analog.unwrap_or(0.0));
         }
+        "attach" => {
+            let bus = cmd.bus.as_deref().unwrap_or("SPI1");
+            let kind = cmd.kind.as_deref().unwrap_or("");
+            session.status = match session.machine.attach_kind(bus, kind, cmd.cs.as_deref()) {
+                Ok(id) => format!("attached {id} to {}", bus.to_ascii_uppercase()),
+                Err(err) => err,
+            };
+        }
+        "detach" => {
+            let id = cmd.device.unwrap_or_default();
+            session.status = if session.machine.detach(&id) {
+                format!("detached {id}")
+            } else {
+                format!("no component {id}")
+            };
+        }
+        "device_set" => {
+            let id = cmd.device.unwrap_or_default();
+            let key = cmd.key.unwrap_or_default();
+            let value = cmd.value.unwrap_or(f64::NAN);
+            session.status = match session.machine.set_device(&id, &key, value) {
+                Ok(()) => format!("{id} {key} = {value}"),
+                Err(err) => err,
+            };
+        }
         _ => {}
     }
 }
@@ -683,7 +746,49 @@ mod tests {
             break_name: None,
             break_kind: None,
             break_value: None,
+            bus: None,
+            kind: None,
+            cs: None,
+            device: None,
+            key: None,
+            value: None,
         }
+    }
+
+    #[test]
+    fn attach_set_and_detach_a_component_over_the_socket_commands() {
+        let mut session = session_with(&[0x0000_006f], &[0, 0, 0, 0]);
+        let mut attach = command("attach");
+        attach.bus = Some("spi1".into());
+        attach.kind = Some("adc".into());
+        attach.cs = Some("PA4".into());
+        apply(&mut session, attach);
+        assert_eq!(session.status, "attached ADC0 to SPI1");
+        let devices = session.machine.devices();
+        assert_eq!(devices[0].cs.as_deref(), Some("PA4"));
+
+        let mut set = command("device_set");
+        set.device = Some("ADC0".into());
+        set.key = Some("ch3".into());
+        set.value = Some(0.5);
+        apply(&mut session, set);
+        assert!(session.status.contains("ch3 = 0.5"), "{}", session.status);
+
+        let mut wrong = command("attach");
+        wrong.bus = Some("I2C1".into());
+        wrong.kind = Some("adc".into());
+        apply(&mut session, wrong);
+        assert!(
+            session.status.contains("does not connect"),
+            "{}",
+            session.status
+        );
+
+        let mut detach = command("detach");
+        detach.device = Some("ADC0".into());
+        apply(&mut session, detach);
+        assert!(session.machine.devices().is_empty());
+        assert!(snapshot(&session)["device_kinds"][0]["kind"] == "adc");
     }
 
     fn session_with(code: &[u32], sram: &[u8]) -> Session {

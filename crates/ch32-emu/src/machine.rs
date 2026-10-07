@@ -3,6 +3,10 @@
 use std::collections::VecDeque;
 
 use crate::cpu::{Bus, Cpu, CpuHeap, CpuScalars, Fault};
+use crate::devices::{
+    Created, DeviceCtx, DeviceSetting, DeviceView, I2cDevice, SpiDevice, UartDevice,
+};
+use crate::serial::{I2c, I2cAction, I2cPhase, Spi};
 
 const UNDO_LIMIT: usize = 10;
 
@@ -28,6 +32,16 @@ const TIM_BASES: [u32; 3] = [0x4000_0000, 0x4000_0400, 0x4000_0800];
 const TIM_IRQS: [u32; 3] = [IRQ_TIM2, IRQ_TIM3, IRQ_TIM4];
 const RCC_BASE: u32 = 0x4002_1000;
 const USART1_BASE: u32 = 0x4001_3800;
+const SPI_BASES: [u32; 2] = [0x4001_3000, 0x4000_3800];
+const SPI_IRQS: [u32; 2] = [51, 52];
+const I2C_BASES: [u32; 2] = [0x4000_5400, 0x4000_5800];
+const I2C_EV_IRQS: [u32; 2] = [47, 49];
+const I2C_ER_IRQS: [u32; 2] = [48, 50];
+const IRQ_USART1: u32 = 53;
+
+const USART_RXNE: u32 = 1 << 5;
+const USART_TC: u32 = 1 << 6;
+const USART_TXE: u32 = 1 << 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -596,6 +610,7 @@ struct Usart {
     cr1: u32,
     brr: u32,
     sr: u32,
+    rx: u8,
     tx: Vec<u8>,
 }
 
@@ -604,7 +619,8 @@ impl Usart {
         Self {
             cr1: 0,
             brr: 0,
-            sr: 0x00c0,
+            sr: USART_TXE | USART_TC,
+            rx: 0,
             tx: Vec::new(),
         }
     }
@@ -612,7 +628,7 @@ impl Usart {
     fn read(&self, offset: u32) -> u32 {
         match offset {
             0x00 => self.sr,
-            0x04 => 0,
+            0x04 => self.rx as u32,
             0x08 => self.brr,
             0x0c => self.cr1,
             _ => 0,
@@ -621,16 +637,150 @@ impl Usart {
 
     fn write(&mut self, offset: u32, value: u32) {
         match offset {
-            0x00 => self.sr = value,
+            // RXNE and TC clear when written as 0. The other flags are read-only.
+            0x00 => self.sr &= value | !(USART_RXNE | USART_TC),
             0x04 => {
                 self.tx.push(value as u8);
-                self.sr |= 0x00c0;
+                self.sr |= USART_TXE | USART_TC;
             }
             0x08 => self.brr = value,
             0x0c => self.cr1 = value,
             _ => {}
         }
     }
+
+    /// UE and RE.
+    fn receiving(&self) -> bool {
+        self.cr1 & (1 << 13) != 0 && self.cr1 & (1 << 2) != 0
+    }
+
+    fn irq_asserted(&self) -> bool {
+        (self.cr1 & (1 << 5) != 0 && self.sr & USART_RXNE != 0)
+            || (self.cr1 & (1 << 6) != 0 && self.sr & USART_TC != 0)
+            || (self.cr1 & (1 << 7) != 0 && self.sr & USART_TXE != 0)
+    }
+}
+
+enum Link {
+    Spi {
+        bus: usize,
+        cs: Option<(usize, u8)>,
+        selected: bool,
+        dev: Box<dyn SpiDevice>,
+    },
+    Uart {
+        dev: Box<dyn UartDevice>,
+    },
+    I2c {
+        bus: usize,
+        dev: Box<dyn I2cDevice>,
+    },
+}
+
+impl Clone for Link {
+    fn clone(&self) -> Self {
+        match self {
+            Link::Spi {
+                bus,
+                cs,
+                selected,
+                dev,
+            } => Link::Spi {
+                bus: *bus,
+                cs: *cs,
+                selected: *selected,
+                dev: dev.clone_box(),
+            },
+            Link::Uart { dev } => Link::Uart {
+                dev: dev.clone_box(),
+            },
+            Link::I2c { bus, dev } => Link::I2c {
+                bus: *bus,
+                dev: dev.clone_box(),
+            },
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Attached {
+    id: String,
+    link: Link,
+}
+
+impl Attached {
+    fn view(&self, ctx: &DeviceCtx) -> DeviceView {
+        match &self.link {
+            Link::Spi { dev, .. } => dev.view(ctx),
+            Link::Uart { dev } => dev.view(ctx),
+            Link::I2c { dev, .. } => dev.view(ctx),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match &self.link {
+            Link::Spi { dev, .. } => dev.kind(),
+            Link::Uart { dev } => dev.kind(),
+            Link::I2c { dev, .. } => dev.kind(),
+        }
+    }
+
+    fn settings(&self) -> Vec<DeviceSetting> {
+        match &self.link {
+            Link::Spi { dev, .. } => dev.settings(),
+            Link::Uart { dev } => dev.settings(),
+            Link::I2c { dev, .. } => dev.settings(),
+        }
+    }
+
+    fn bus_name(&self) -> String {
+        match &self.link {
+            Link::Spi { bus, .. } => format!("SPI{}", bus + 1),
+            Link::Uart { .. } => "USART1".into(),
+            Link::I2c { bus, .. } => format!("I2C{}", bus + 1),
+        }
+    }
+
+    fn cs_name(&self) -> Option<String> {
+        match &self.link {
+            Link::Spi {
+                cs: Some((port, pin)),
+                ..
+            } => Some(pin_name(*port, *pin)),
+            _ => None,
+        }
+    }
+}
+
+/// An attached component, as listed for the UI.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub kind: String,
+    pub bus: String,
+    pub cs: Option<String>,
+    pub selected: bool,
+    pub settings: Vec<DeviceSetting>,
+}
+
+fn pin_name(port: usize, pin: u8) -> String {
+    format!("P{}{pin}", b"ABCD"[port] as char)
+}
+
+/// Parse `PA4` style pin names.
+pub fn parse_pin(name: &str) -> Option<(usize, u8)> {
+    let name = name.trim().to_ascii_uppercase();
+    let rest = name.strip_prefix('P')?;
+    let mut chars = rest.chars();
+    let port = match chars.next()? {
+        'A' => 0,
+        'B' => 1,
+        'C' => 2,
+        'D' => 3,
+        _ => return None,
+    };
+    let pin: u8 = chars.as_str().parse().ok()?;
+    (pin < 16).then_some((port, pin))
 }
 
 #[derive(Clone, Copy)]
@@ -667,7 +817,12 @@ struct Undo {
     usart_cr1: u32,
     usart_brr: u32,
     usart_sr: u32,
+    usart_rx: u8,
     usart_tx: Option<Vec<u8>>,
+    spi: [Spi; 2],
+    i2c: [I2c; 2],
+    /// Attached components before this instruction, kept only when the instruction touched one.
+    devices: Option<Vec<Attached>>,
     pfic_enable: [u32; 8],
     pfic_pending: [u32; 8],
     pfic_active: [u32; 8],
@@ -688,6 +843,13 @@ pub struct Machine {
     pfic: Pfic,
     rcc: Rcc,
     usart1: Usart,
+    spi: [Spi; 2],
+    i2c: [I2c; 2],
+    devices: Vec<Attached>,
+    device_backup: Option<Vec<Attached>>,
+    next_device: u32,
+    /// Guest cycle handed to components. Set at the start of each instruction.
+    now: u64,
     pub uart_tx: String,
     pub entry: u32,
     pub faults: Vec<String>,
@@ -717,6 +879,12 @@ impl Machine {
             pfic: Pfic::new(),
             rcc: Rcc::new(),
             usart1: Usart::new(),
+            spi: [Spi::new(); 2],
+            i2c: [I2c::new(); 2],
+            devices: Vec::new(),
+            device_backup: None,
+            next_device: 0,
+            now: 0,
             uart_tx: String::new(),
             entry: FLASH_BASE,
             faults: Vec::new(),
@@ -764,12 +932,30 @@ impl Machine {
         self.pfic = Pfic::new();
         self.rcc = Rcc::new();
         self.usart1 = Usart::new();
+        self.spi = [Spi::new(); 2];
+        self.i2c = [I2c::new(); 2];
         self.uart_tx.clear();
         self.faults.clear();
         for (addr, data) in segments {
             let _ = self.write_bytes(*addr, data);
         }
         self.cpu.reset(self.entry);
+        self.now = self.cpu.cycle;
+        let ctx = self.ctx();
+        for attached in &mut self.devices {
+            match &mut attached.link {
+                Link::Spi {
+                    cs, selected, dev, ..
+                } => {
+                    dev.reset();
+                    *selected = cs.is_none();
+                    dev.select(*selected, &ctx);
+                }
+                Link::Uart { dev } => dev.reset(),
+                Link::I2c { dev, .. } => dev.reset(),
+            }
+        }
+        self.update_chip_selects();
     }
 
     pub fn step(&mut self) -> Result<(), Fault> {
@@ -778,9 +964,299 @@ impl Machine {
         let result = self.step_inner();
         self.journaling = false;
         undo.mem = self.journal.clone();
+        undo.devices = self.device_backup.take();
         self.journal.clear();
         self.push_undo(undo);
         result
+    }
+
+    fn ctx(&self) -> DeviceCtx {
+        DeviceCtx { cycle: self.now }
+    }
+
+    /// Keep the pre-instruction components so reverse step can restore them.
+    fn touch_devices(&mut self) {
+        if self.journaling && self.device_backup.is_none() && !self.devices.is_empty() {
+            self.device_backup = Some(self.devices.clone());
+        }
+    }
+
+    /// Attach a component on SPI1 (`bus` 0) or SPI2 (`bus` 1). With a chip-select pin the
+    /// component is selected while that GPIO reads low. Without one it is always selected.
+    pub fn attach_spi(
+        &mut self,
+        bus: usize,
+        cs: Option<(usize, u8)>,
+        mut dev: Box<dyn SpiDevice>,
+    ) -> String {
+        let id = self.device_id(dev.kind());
+        self.now = self.cpu.cycle;
+        let selected = cs.is_none();
+        dev.select(selected, &self.ctx());
+        self.devices.push(Attached {
+            id: id.clone(),
+            link: Link::Spi {
+                bus: bus.min(1),
+                cs,
+                selected,
+                dev,
+            },
+        });
+        self.clear_undo();
+        self.update_chip_selects();
+        id
+    }
+
+    /// Attach a component to USART1 TX and RX.
+    pub fn attach_uart(&mut self, dev: Box<dyn UartDevice>) -> String {
+        let id = self.device_id(dev.kind());
+        self.devices.push(Attached {
+            id: id.clone(),
+            link: Link::Uart { dev },
+        });
+        self.clear_undo();
+        id
+    }
+
+    /// Attach a target on I2C1 (`bus` 0) or I2C2 (`bus` 1).
+    pub fn attach_i2c(&mut self, bus: usize, dev: Box<dyn I2cDevice>) -> String {
+        let id = self.device_id(dev.kind());
+        self.devices.push(Attached {
+            id: id.clone(),
+            link: Link::I2c {
+                bus: bus.min(1),
+                dev,
+            },
+        });
+        self.clear_undo();
+        id
+    }
+
+    /// Attach a built-in component by kind (see [`crate::devices::KINDS`]).
+    /// `bus` is `SPI1`, `SPI2`, `USART1`, `I2C1`, or `I2C2`. `cs` is a pin like `PA4`.
+    pub fn attach_kind(
+        &mut self,
+        bus: &str,
+        kind: &str,
+        cs: Option<&str>,
+    ) -> Result<String, String> {
+        let bus = bus.trim().to_ascii_uppercase();
+        let cs = match cs.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(name) => {
+                Some(parse_pin(name).ok_or_else(|| format!("bad chip-select pin {name}"))?)
+            }
+            None => None,
+        };
+        let created =
+            crate::devices::create(kind).ok_or_else(|| format!("unknown component {kind}"))?;
+        match (bus.as_str(), created) {
+            ("SPI1", Created::Spi(dev)) => Ok(self.attach_spi(0, cs, dev)),
+            ("SPI2", Created::Spi(dev)) => Ok(self.attach_spi(1, cs, dev)),
+            ("USART1", Created::Uart(dev)) => Ok(self.attach_uart(dev)),
+            ("I2C1", Created::I2c(dev)) => Ok(self.attach_i2c(0, dev)),
+            ("I2C2", Created::I2c(dev)) => Ok(self.attach_i2c(1, dev)),
+            (bus, _) => Err(format!("{kind} does not connect to {bus}")),
+        }
+    }
+
+    pub fn detach(&mut self, id: &str) -> bool {
+        let before = self.devices.len();
+        self.devices.retain(|d| d.id != id);
+        let removed = self.devices.len() != before;
+        if removed {
+            self.clear_undo();
+        }
+        removed
+    }
+
+    /// Change a component setting from the UI.
+    pub fn set_device(&mut self, id: &str, key: &str, value: f64) -> Result<(), String> {
+        let attached = self
+            .devices
+            .iter_mut()
+            .find(|d| d.id == id)
+            .ok_or_else(|| format!("no component {id}"))?;
+        let result = match &mut attached.link {
+            Link::Spi { dev, .. } => dev.set(key, value),
+            Link::Uart { dev } => dev.set(key, value),
+            Link::I2c { dev, .. } => dev.set(key, value),
+        };
+        if result.is_ok() {
+            self.clear_undo();
+        }
+        result
+    }
+
+    pub fn devices(&self) -> Vec<DeviceInfo> {
+        self.devices
+            .iter()
+            .map(|d| DeviceInfo {
+                id: d.id.clone(),
+                kind: d.kind().into(),
+                bus: d.bus_name(),
+                cs: d.cs_name(),
+                selected: matches!(d.link, Link::Spi { selected: true, .. }),
+                settings: d.settings(),
+            })
+            .collect()
+    }
+
+    fn device_id(&mut self, kind: &str) -> String {
+        let id = format!("{}{}", kind.to_ascii_uppercase(), self.next_device);
+        self.next_device += 1;
+        id
+    }
+
+    fn update_chip_selects(&mut self) {
+        if self.devices.is_empty() {
+            return;
+        }
+        let changes: Vec<(usize, bool)> = self
+            .devices
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| match &d.link {
+                Link::Spi {
+                    cs: Some((port, pin)),
+                    selected,
+                    ..
+                } => {
+                    let want = self.gpio[*port].level_of(*pin) == PinLevel::Low;
+                    (want != *selected).then_some((i, want))
+                }
+                _ => None,
+            })
+            .collect();
+        if changes.is_empty() {
+            return;
+        }
+        self.touch_devices();
+        let ctx = self.ctx();
+        for (i, want) in changes {
+            if let Link::Spi { selected, dev, .. } = &mut self.devices[i].link {
+                *selected = want;
+                dev.select(want, &ctx);
+            }
+        }
+    }
+
+    fn spi_clock(&self, bus: usize) -> bool {
+        if bus == 0 {
+            self.rcc.apb2en() & (1 << 12) != 0
+        } else {
+            self.rcc.apb1en() & (1 << 14) != 0
+        }
+    }
+
+    fn i2c_clock(&self, bus: usize) -> bool {
+        self.rcc.apb1en() & (1 << (21 + bus)) != 0
+    }
+
+    /// Shift one frame to every selected component on the bus. MISO idles high, so
+    /// overlapping replies AND together.
+    fn spi_exchange(&mut self, bus: usize, frame: u16) -> u16 {
+        let wire = self.spi[bus].wire_bytes(frame);
+        let mut miso = vec![0xffu8; wire.len()];
+        self.touch_devices();
+        let ctx = self.ctx();
+        for attached in &mut self.devices {
+            if let Link::Spi {
+                bus: b,
+                selected: true,
+                dev,
+                ..
+            } = &mut attached.link
+            {
+                if *b == bus {
+                    for (out, &byte) in miso.iter_mut().zip(&wire) {
+                        *out &= dev.transfer(byte, &ctx);
+                    }
+                }
+            }
+        }
+        self.spi[bus].frame_from_wire(&miso)
+    }
+
+    fn i2c_target(&mut self, bus: usize, address: u8) -> Option<&mut Box<dyn I2cDevice>> {
+        self.devices.iter_mut().find_map(|d| match &mut d.link {
+            Link::I2c { bus: b, dev } if *b == bus && dev.address() == address => Some(dev),
+            _ => None,
+        })
+    }
+
+    fn i2c_act(&mut self, bus: usize, action: I2cAction) {
+        if action == I2cAction::None {
+            return;
+        }
+        self.touch_devices();
+        let ctx = self.ctx();
+        match action {
+            I2cAction::None => {}
+            I2cAction::Address(address, read) => {
+                let ack = self
+                    .i2c_target(bus, address)
+                    .is_some_and(|dev| dev.start(read, &ctx));
+                self.i2c[bus].addressed(address, read, ack);
+            }
+            I2cAction::Write(byte) => {
+                let ack = match self.i2c[bus].target {
+                    Some(address) => self
+                        .i2c_target(bus, address)
+                        .is_some_and(|dev| dev.write(byte, &ctx)),
+                    None => false,
+                };
+                self.i2c[bus].written(ack);
+            }
+            I2cAction::Read => {
+                let byte = match self.i2c[bus].target {
+                    Some(address) => self
+                        .i2c_target(bus, address)
+                        .map_or(0xff, |dev| dev.read(&ctx)),
+                    None => 0xff,
+                };
+                self.i2c[bus].received(byte);
+            }
+            I2cAction::Stop(address) => {
+                if let Some(dev) = self.i2c_target(bus, address) {
+                    dev.stop(&ctx);
+                }
+            }
+        }
+    }
+
+    fn uart_send(&mut self, byte: u8) {
+        if !self
+            .devices
+            .iter()
+            .any(|d| matches!(d.link, Link::Uart { .. }))
+        {
+            return;
+        }
+        self.touch_devices();
+        let ctx = self.ctx();
+        for attached in &mut self.devices {
+            if let Link::Uart { dev } = &mut attached.link {
+                dev.receive(byte, &ctx);
+            }
+        }
+    }
+
+    fn poll_uart_devices(&mut self) {
+        if self.devices.is_empty() || self.usart1.sr & USART_RXNE != 0 || !self.usart1.receiving() {
+            return;
+        }
+        let ctx = self.ctx();
+        let Some(index) = self.devices.iter().position(|d| match &d.link {
+            Link::Uart { dev } => dev.has_byte(&ctx),
+            _ => false,
+        }) else {
+            return;
+        };
+        self.touch_devices();
+        if let Link::Uart { dev } = &mut self.devices[index].link {
+            self.usart1.rx = dev.take_byte(&ctx);
+            self.usart1.sr |= USART_RXNE;
+        }
     }
 
     /// How many instructions can still be reversed. At most [`UNDO_LIMIT`].
@@ -807,6 +1283,12 @@ impl Machine {
         self.usart1.cr1 = undo.usart_cr1;
         self.usart1.brr = undo.usart_brr;
         self.usart1.sr = undo.usart_sr;
+        self.usart1.rx = undo.usart_rx;
+        self.spi = undo.spi;
+        self.i2c = undo.i2c;
+        if let Some(devices) = undo.devices {
+            self.devices = devices;
+        }
         if let Some(tx) = undo.usart_tx {
             self.usart1.tx = tx;
         } else {
@@ -831,6 +1313,7 @@ impl Machine {
     fn clear_undo(&mut self) {
         self.undo.clear();
         self.journal.clear();
+        self.device_backup = None;
         self.journaling = false;
     }
 
@@ -851,11 +1334,15 @@ impl Machine {
             usart_cr1: self.usart1.cr1,
             usart_brr: self.usart1.brr,
             usart_sr: self.usart1.sr,
+            usart_rx: self.usart1.rx,
             usart_tx: if self.usart1.tx.is_empty() {
                 None
             } else {
                 Some(self.usart1.tx.clone())
             },
+            spi: self.spi,
+            i2c: self.i2c,
+            devices: None,
             pfic_enable: self.pfic.enable,
             pfic_pending: self.pfic.pending,
             pfic_active: self.pfic.active,
@@ -913,6 +1400,7 @@ impl Machine {
     }
 
     fn step_inner(&mut self) -> Result<(), Fault> {
+        self.now = self.cpu.cycle;
         self.sync_lines();
         // Move the core out so the machine can act as the bus during the instruction.
         let mut cpu = std::mem::take(&mut self.cpu);
@@ -943,6 +1431,7 @@ impl Machine {
                     self.timers[2].tick();
                 }
                 self.drain_uart();
+                self.poll_uart_devices();
                 Ok(())
             }
             Err(f) => {
@@ -964,11 +1453,26 @@ impl Machine {
     }
 
     fn sync_lines(&mut self) {
-        for timer in &self.timers {
-            self.pfic.set_pending(timer.irq, timer.irq_asserted());
+        for (irq, asserted) in self.irq_lines() {
+            self.pfic.set_pending(irq, asserted);
         }
-        self.pfic
-            .set_pending(IRQ_SYSTICK, self.systick.irq_asserted());
+    }
+
+    /// Level of every peripheral interrupt line the model drives.
+    fn irq_lines(&self) -> [(u32, bool); 11] {
+        [
+            (self.timers[0].irq, self.timers[0].irq_asserted()),
+            (self.timers[1].irq, self.timers[1].irq_asserted()),
+            (self.timers[2].irq, self.timers[2].irq_asserted()),
+            (IRQ_SYSTICK, self.systick.irq_asserted()),
+            (SPI_IRQS[0], self.spi[0].irq_asserted()),
+            (SPI_IRQS[1], self.spi[1].irq_asserted()),
+            (I2C_EV_IRQS[0], self.i2c[0].ev_irq()),
+            (I2C_ER_IRQS[0], self.i2c[0].er_irq()),
+            (I2C_EV_IRQS[1], self.i2c[1].ev_irq()),
+            (I2C_ER_IRQS[1], self.i2c[1].er_irq()),
+            (IRQ_USART1, self.usart1.irq_asserted()),
+        ]
     }
 
     pub fn pin(&self, port: usize, pin: u8) -> PinView {
@@ -1003,6 +1507,8 @@ impl Machine {
         if port < 4 && pin < 16 {
             self.gpio[port].external[pin as usize] = drive;
             self.gpio[port].analog_v[pin as usize] = analog_v;
+            self.now = self.cpu.cycle;
+            self.update_chip_selects();
         }
     }
 
@@ -1108,6 +1614,18 @@ impl Machine {
         }
         if (USART1_BASE..USART1_BASE + 0x20).contains(&addr) {
             return Some(self.usart1.read(addr - USART1_BASE));
+        }
+        for (i, &base) in SPI_BASES.iter().enumerate() {
+            if (base..base + 0x400).contains(&addr) {
+                let on = self.spi_clock(i);
+                return Some(if on { self.spi[i].read(addr - base) } else { 0 });
+            }
+        }
+        for (i, &base) in I2C_BASES.iter().enumerate() {
+            if (base..base + 0x400).contains(&addr) {
+                let on = self.i2c_clock(i);
+                return Some(if on { self.i2c[i].read(addr - base) } else { 0 });
+            }
         }
         if (SYSTICK_BASE..SYSTICK_BASE + 0x20).contains(&addr) {
             return Some(self.systick.read(addr - SYSTICK_BASE));
@@ -1242,7 +1760,33 @@ impl Machine {
             return Some(self.rcc.regs[((addr - RCC_BASE) / 4) as usize]);
         }
         if (USART1_BASE..USART1_BASE + 0x20).contains(&addr) {
+            if addr - USART1_BASE == 0x04 {
+                self.usart1.sr &= !USART_RXNE;
+            }
             return Some(self.usart1.read(addr - USART1_BASE));
+        }
+        for (i, &base) in SPI_BASES.iter().enumerate() {
+            if (base..base + 0x400).contains(&addr) {
+                if !self.spi_clock(i) {
+                    return Some(0);
+                }
+                let offset = addr - base;
+                return Some(if offset == crate::serial::SPI_DATAR {
+                    self.spi[i].read_data()
+                } else {
+                    self.spi[i].read(offset)
+                });
+            }
+        }
+        for (i, &base) in I2C_BASES.iter().enumerate() {
+            if (base..base + 0x400).contains(&addr) {
+                if !self.i2c_clock(i) {
+                    return Some(0);
+                }
+                let (value, action) = self.i2c[i].load(addr - base);
+                self.i2c_act(i, action);
+                return Some(value);
+            }
         }
         if (SYSTICK_BASE..SYSTICK_BASE + 0x20).contains(&addr) {
             return Some(self.systick.read(addr - SYSTICK_BASE));
@@ -1258,6 +1802,27 @@ impl Machine {
         for (i, &base) in GPIO_BASES.iter().enumerate() {
             if (base..base + 0x400).contains(&addr) {
                 self.gpio[i].write(addr - base, val);
+                self.update_chip_selects();
+                return true;
+            }
+        }
+        for (i, &base) in SPI_BASES.iter().enumerate() {
+            if (base..base + 0x400).contains(&addr) {
+                if self.spi_clock(i) {
+                    if let Some(frame) = self.spi[i].write(addr - base, val) {
+                        let rx = self.spi_exchange(i, frame);
+                        self.spi[i].complete(frame, rx);
+                    }
+                }
+                return true;
+            }
+        }
+        for (i, &base) in I2C_BASES.iter().enumerate() {
+            if (base..base + 0x400).contains(&addr) {
+                if self.i2c_clock(i) {
+                    let action = self.i2c[i].write(addr - base, val);
+                    self.i2c_act(i, action);
+                }
                 return true;
             }
         }
@@ -1280,6 +1845,17 @@ impl Machine {
                 if val & 4 != 0 {
                     self.timers[2] = Timer::new(IRQ_TIM4);
                 }
+                if val & (1 << 14) != 0 {
+                    self.spi[1] = Spi::new();
+                }
+                for bus in 0..2 {
+                    if val & (1 << (21 + bus)) != 0 {
+                        if let Some(address) = self.i2c[bus].target {
+                            self.i2c_act(bus, I2cAction::Stop(address));
+                        }
+                        self.i2c[bus] = I2c::new();
+                    }
+                }
             }
             if idx == 3 {
                 if val & (1 << 2) != 0 {
@@ -1294,6 +1870,15 @@ impl Machine {
                 if val & (1 << 5) != 0 {
                     self.gpio[3] = GpioPort::new();
                 }
+                if val & (1 << 12) != 0 {
+                    self.spi[0] = Spi::new();
+                }
+                if val & (1 << 14) != 0 {
+                    let tx = std::mem::take(&mut self.usart1.tx);
+                    self.usart1 = Usart::new();
+                    self.usart1.tx = tx;
+                }
+                self.update_chip_selects();
             }
             self.rcc.regs[idx] = val;
             self.rcc.sync();
@@ -1301,6 +1886,9 @@ impl Machine {
         }
         if (USART1_BASE..USART1_BASE + 0x20).contains(&addr) {
             self.usart1.write(addr - USART1_BASE, val);
+            if addr - USART1_BASE == 0x04 {
+                self.uart_send(val as u8);
+            }
             return true;
         }
         if (SYSTICK_BASE..SYSTICK_BASE + 0x20).contains(&addr) {
@@ -1359,8 +1947,286 @@ impl Machine {
         out.push(self.rcc_view());
         out.push(self.systick_view());
         out.push(self.usart_view());
+        for bus in 0..2 {
+            out.push(self.spi_view(bus));
+        }
+        for bus in 0..2 {
+            out.push(self.i2c_view(bus));
+        }
         out.push(self.pfic_view());
+        for attached in &self.devices {
+            out.push(self.device_view(attached));
+        }
         out
+    }
+
+    fn devices_on(&self, bus: &str) -> Vec<&Attached> {
+        self.devices
+            .iter()
+            .filter(|d| d.bus_name() == bus)
+            .collect()
+    }
+
+    fn spi_view(&self, bus: usize) -> PeripheralView {
+        use crate::serial::{
+            SPI_CTLR1, SPI_CTLR2, SPI_DATAR, SPI_OVR, SPI_RXNE, SPI_STATR, SPI_TXE,
+        };
+        let spi = &self.spi[bus];
+        let base = SPI_BASES[bus];
+        let id = format!("SPI{}", bus + 1);
+        let clock = self.spi_clock(bus);
+        let attached = self.devices_on(&id);
+        let names: Vec<String> = attached
+            .iter()
+            .map(|d| match &d.link {
+                Link::Spi { cs, selected, .. } => {
+                    let cs = cs.map_or("no CS".to_string(), |(p, n)| {
+                        format!("CS {}", pin_name(p, n))
+                    });
+                    let state = if *selected { "selected" } else { "idle" };
+                    format!("{} ({cs}, {state})", d.id)
+                }
+                _ => d.id.clone(),
+            })
+            .collect();
+        let selected: Vec<&str> = attached
+            .iter()
+            .filter(|d| matches!(d.link, Link::Spi { selected: true, .. }))
+            .map(|d| d.id.as_str())
+            .collect();
+        let width = if spi.sixteen_bit() { 16 } else { 8 };
+        let action = if !clock {
+            format!("{id} clock is off (RCC). Register reads return 0 and writes are ignored.")
+        } else if !spi.enabled_master() {
+            format!("{id} is not enabled as master (SPE and MSTR in CTLR1). A store to DATAR does nothing.")
+        } else if selected.is_empty() {
+            format!(
+                "Idle. A store to DATAR at {:#010x} clocks out one {width}-bit frame. No component is selected, so MISO reads 0xff.",
+                base + SPI_DATAR
+            )
+        } else {
+            format!(
+                "Idle. A store to DATAR at {:#010x} clocks out one {width}-bit frame to {} and the reply lands in DATAR with RXNE set, in the same instruction.",
+                base + SPI_DATAR,
+                selected.join(", ")
+            )
+        };
+        let flag = |mask: u32| u8::from(spi.statr & mask != 0);
+        let inputs = vec![
+            signal(
+                "clock enable",
+                Some(RCC_BASE + if bus == 0 { 0x18 } else { 0x1c }),
+                format!("{}", u8::from(clock)),
+            ),
+            signal(
+                "CTLR1",
+                Some(base + SPI_CTLR1),
+                format!(
+                    "{:#06x} (SPE {}, MSTR {}, mode {}, {}-bit, {} first, BR /{})",
+                    spi.ctlr1,
+                    u8::from(spi.ctlr1 & (1 << 6) != 0),
+                    u8::from(spi.ctlr1 & (1 << 2) != 0),
+                    spi.mode(),
+                    width,
+                    if spi.lsb_first() { "LSB" } else { "MSB" },
+                    2u32 << ((spi.ctlr1 >> 3) & 7)
+                ),
+            ),
+            signal(
+                "CTLR2",
+                Some(base + SPI_CTLR2),
+                format!("{:#06x}", spi.ctlr2),
+            ),
+            signal(
+                "STATR",
+                Some(base + SPI_STATR),
+                format!(
+                    "{:#06x} (RXNE {}, TXE {}, OVR {})",
+                    spi.statr,
+                    flag(SPI_RXNE),
+                    flag(SPI_TXE),
+                    flag(SPI_OVR)
+                ),
+            ),
+            signal(
+                "components",
+                None,
+                if names.is_empty() {
+                    "(none attached)".into()
+                } else {
+                    names.join(", ")
+                },
+            ),
+        ];
+        let outputs = vec![
+            signal(
+                "DATAR (received)",
+                Some(base + SPI_DATAR),
+                format!("{:#06x}", spi.rx),
+            ),
+            signal(
+                "last frame",
+                None,
+                match (spi.last_tx, spi.last_rx) {
+                    (Some(tx), Some(rx)) => format!("MOSI {tx:#06x}, MISO {rx:#06x}"),
+                    _ => "(none yet)".into(),
+                },
+            ),
+            signal("frames", None, spi.frames.to_string()),
+            signal(
+                "IRQ line",
+                None,
+                format!(
+                    "{} = {}",
+                    irq_label(SPI_IRQS[bus]),
+                    u8::from(spi.irq_asserted())
+                ),
+            ),
+        ];
+        PeripheralView {
+            id,
+            group: "SPI".into(),
+            action,
+            inputs,
+            outputs,
+            effects: Vec::new(),
+        }
+    }
+
+    fn i2c_view(&self, bus: usize) -> PeripheralView {
+        use crate::serial::{
+            I2C_ACK, I2C_ADDR, I2C_AF, I2C_BTF, I2C_CTLR1, I2C_CTLR2, I2C_DATAR, I2C_RXNE, I2C_SB,
+            I2C_STAR1, I2C_STAR2, I2C_TXE,
+        };
+        let i2c = &self.i2c[bus];
+        let base = I2C_BASES[bus];
+        let id = format!("I2C{}", bus + 1);
+        let clock = self.i2c_clock(bus);
+        let attached = self.devices_on(&id);
+        let names: Vec<String> = attached
+            .iter()
+            .map(|d| match &d.link {
+                Link::I2c { dev, .. } => format!("{} at {:#04x}", d.id, dev.address()),
+                _ => d.id.clone(),
+            })
+            .collect();
+        let target = i2c.target.map(|a| format!("{a:#04x}"));
+        let action = if !clock {
+            format!("{id} clock is off (RCC). Register reads return 0 and writes are ignored.")
+        } else {
+            match i2c.phase {
+                I2cPhase::Idle => format!("Bus idle. Setting START in CTLR1 at {:#010x} begins a transaction.", base + I2C_CTLR1),
+                I2cPhase::Address => format!(
+                    "START sent (SB set). The next store to DATAR at {:#010x} is the address byte.",
+                    base + I2C_DATAR
+                ),
+                I2cPhase::Nacked => "The target did not acknowledge (AF set). Firmware should send STOP.".into(),
+                I2cPhase::Transmit => format!(
+                    "Writing to {}. A store to DATAR sends one byte and sets TXE and BTF when it is acknowledged.",
+                    target.clone().unwrap_or_default()
+                ),
+                I2cPhase::Receive => format!(
+                    "Reading from {}. Each DATAR load takes a byte; with ACK set the next byte is fetched right away.",
+                    target.clone().unwrap_or_default()
+                ),
+            }
+        };
+        let flag = |mask: u32| u8::from(i2c.star1 & mask != 0);
+        let inputs = vec![
+            signal(
+                "clock enable",
+                Some(RCC_BASE + 0x1c),
+                format!("{}", u8::from(clock)),
+            ),
+            signal(
+                "CTLR1",
+                Some(base + I2C_CTLR1),
+                format!(
+                    "{:#06x} (PE {}, ACK {})",
+                    i2c.ctlr1,
+                    i2c.ctlr1 & 1,
+                    u8::from(i2c.ctlr1 & I2C_ACK != 0)
+                ),
+            ),
+            signal(
+                "CTLR2",
+                Some(base + I2C_CTLR2),
+                format!("{:#06x}", i2c.ctlr2),
+            ),
+            signal(
+                "components",
+                None,
+                if names.is_empty() {
+                    "(none attached)".into()
+                } else {
+                    names.join(", ")
+                },
+            ),
+        ];
+        let outputs = vec![
+            signal(
+                "STAR1",
+                Some(base + I2C_STAR1),
+                format!(
+                    "{:#06x} (SB {}, ADDR {}, BTF {}, RxNE {}, TxE {}, AF {})",
+                    i2c.star1,
+                    flag(I2C_SB),
+                    flag(I2C_ADDR),
+                    flag(I2C_BTF),
+                    flag(I2C_RXNE),
+                    flag(I2C_TXE),
+                    flag(I2C_AF)
+                ),
+            ),
+            signal(
+                "STAR2",
+                Some(base + I2C_STAR2),
+                format!("{:#06x}", i2c.star2),
+            ),
+            signal(
+                "DATAR",
+                Some(base + I2C_DATAR),
+                format!("{:#04x}", i2c.data),
+            ),
+            signal("addressed", None, target.unwrap_or_else(|| "(none)".into())),
+            signal("bytes", None, i2c.bytes.to_string()),
+        ];
+        PeripheralView {
+            id,
+            group: "I2C".into(),
+            action,
+            inputs,
+            outputs,
+            effects: Vec::new(),
+        }
+    }
+
+    fn device_view(&self, attached: &Attached) -> PeripheralView {
+        let view = attached.view(&DeviceCtx {
+            cycle: self.cpu.cycle,
+        });
+        let mut wiring = format!("On {}", attached.bus_name());
+        if let Some(cs) = attached.cs_name() {
+            wiring.push_str(&format!(", chip select {cs}"));
+        }
+        let mut inputs = vec![signal("bus", None, wiring.clone())];
+        inputs.extend(
+            view.inputs
+                .into_iter()
+                .map(|r| signal(r.name, None, r.value)),
+        );
+        PeripheralView {
+            id: attached.id.clone(),
+            group: "Devices".into(),
+            action: format!("{wiring}. {}", view.action),
+            inputs,
+            outputs: view
+                .outputs
+                .into_iter()
+                .map(|r| signal(r.name, None, r.value))
+                .collect(),
+            effects: Vec::new(),
+        }
     }
 
     fn timer_view(&self, index: usize) -> PeripheralView {
@@ -1741,12 +2607,35 @@ impl Machine {
                     Some(USART1_BASE + 0x0c),
                     format!("{:#010x}", usart.cr1),
                 ),
+                signal("components", None, {
+                    let names: Vec<&str> = self
+                        .devices_on("USART1")
+                        .iter()
+                        .map(|d| d.id.as_str())
+                        .collect();
+                    if names.is_empty() {
+                        "(none attached)".to_string()
+                    } else {
+                        names.join(", ")
+                    }
+                }),
             ],
             outputs: vec![
                 signal(
                     "STATR",
                     Some(USART1_BASE),
-                    format!("{:#010x} (TXE and TC follow bit 6 and bit 7)", usart.sr),
+                    format!(
+                        "{:#010x} (RXNE {}, TC {}, TXE {})",
+                        usart.sr,
+                        u8::from(usart.sr & USART_RXNE != 0),
+                        u8::from(usart.sr & USART_TC != 0),
+                        u8::from(usart.sr & USART_TXE != 0)
+                    ),
+                ),
+                signal(
+                    "DATAR (received)",
+                    Some(USART1_BASE + 0x04),
+                    format!("{:#04x}", usart.rx),
                 ),
                 signal(
                     "log",
@@ -1771,10 +2660,9 @@ impl Machine {
 
     fn pfic_view(&self) -> PeripheralView {
         let mut next = self.pfic.clone();
-        for timer in &self.timers {
-            next.set_pending(timer.irq, timer.irq_asserted());
+        for (irq, asserted) in self.irq_lines() {
+            next.set_pending(irq, asserted);
         }
-        next.set_pending(IRQ_SYSTICK, self.systick.irq_asserted());
         let mut effects = Vec::new();
         for word in 0..8 {
             let old = self.pfic.pending[word];
@@ -1964,6 +2852,13 @@ fn irq_label(irq: u32) -> String {
         IRQ_TIM2 => "TIM2".into(),
         IRQ_TIM3 => "TIM3".into(),
         IRQ_TIM4 => "TIM4".into(),
+        47 => "I2C1_EV".into(),
+        48 => "I2C1_ER".into(),
+        49 => "I2C2_EV".into(),
+        50 => "I2C2_ER".into(),
+        51 => "SPI1".into(),
+        52 => "SPI2".into(),
+        IRQ_USART1 => "USART1".into(),
         other => format!("IRQ{other}"),
     }
 }
@@ -2014,22 +2909,19 @@ fn mode_name(mode: PinMode) -> &'static str {
 }
 
 impl Bus for Machine {
+    // Peripheral registers are read once per access, so read side effects
+    // (SPI RXNE, I2C ADDR, USART RXNE) happen once. Narrow stores merge into
+    // the current register value and issue a single word write.
     fn load8(&mut self, addr: u32) -> Result<u8, Fault> {
-        if self.mmio_word(addr & !3).is_some() {
-            let word = self.mmio_word(addr & !3).unwrap();
+        if let Some(word) = self.mmio_word(addr & !3) {
             return Ok(word.to_le_bytes()[(addr & 3) as usize]);
         }
         self.load_bus(addr).map_err(|_| Fault::LoadFault)
     }
 
     fn load16(&mut self, addr: u32) -> Result<u16, Fault> {
-        if self.mmio_word(addr & !3).is_some() && addr & 2 == 0 {
-            let word = self.load32(addr & !3)?;
-            return Ok(if addr & 2 == 0 {
-                word as u16
-            } else {
-                (word >> 16) as u16
-            });
+        if let Some(word) = self.mmio_word(addr & !3) {
+            return Ok((word >> ((addr & 2) * 8)) as u16);
         }
         self.load16_bus(addr).map_err(|_| Fault::InstructionFault)
     }
@@ -2039,16 +2931,20 @@ impl Bus for Machine {
     }
 
     fn store8(&mut self, addr: u32, val: u8) -> Result<(), Fault> {
-        if self.mmio_word(addr & !3).is_some() {
-            let aligned = addr & !3;
-            let mut word = self.load32_bus(aligned).unwrap_or(0).to_le_bytes();
-            word[(addr & 3) as usize] = val;
-            return self.store32_bus(aligned, u32::from_le_bytes(word));
+        if let Some(word) = self.peek_mmio_word(addr & !3) {
+            let mut bytes = word.to_le_bytes();
+            bytes[(addr & 3) as usize] = val;
+            return self.store32_bus(addr & !3, u32::from_le_bytes(bytes));
         }
         self.store_bus(addr, val)
     }
 
     fn store16(&mut self, addr: u32, val: u16) -> Result<(), Fault> {
+        if let Some(word) = self.peek_mmio_word(addr & !3) {
+            let shift = (addr & 2) * 8;
+            let merged = (word & !(0xffff << shift)) | ((val as u32) << shift);
+            return self.store32_bus(addr & !3, merged);
+        }
         self.store8(addr, val as u8)?;
         self.store8(addr.wrapping_add(1), (val >> 8) as u8)
     }
@@ -2267,5 +3163,233 @@ mod tests {
         assert_eq!(m.cpu.cycle, 2);
         assert_eq!(m.gpio[0].external[0], ExternalDrive::High);
         assert_eq!(m.gpio[0].analog_v[0], 1.5);
+    }
+
+    use crate::devices::{Component, DeviceCtx, DeviceView, I2cDevice, SimAdc, UartDevice};
+
+    const SPI1_DATAR: u32 = 0x4001_300c;
+    const SPI1_STATR: u32 = 0x4001_3008;
+    const GPIOA_BSHR: u32 = 0x4001_0810;
+
+    /// The register sequence ch32-hal uses: RCC clocks, PA4 push-pull, SPI1 master mode 0.
+    fn spi_adc_machine() -> (Machine, String) {
+        let mut m = Machine::new();
+        let id = m.attach_kind("SPI1", "adc", Some("PA4")).unwrap();
+        m.store32(RCC_BASE + 0x18, (1 << 12) | (1 << 2)).unwrap();
+        m.store32(0x4001_0800, 0x4444_0444 | (0x3 << 16)).unwrap(); // PA4 output
+        m.store32(GPIOA_BSHR, 1 << 4).unwrap(); // CS high
+        m.store32(
+            0x4001_3000,
+            (1 << 2) | (3 << 3) | (1 << 6) | (1 << 8) | (1 << 9),
+        )
+        .unwrap();
+        (m, id)
+    }
+
+    fn xfer(m: &mut Machine, byte: u8) -> u8 {
+        assert_ne!(m.load32(SPI1_STATR).unwrap() & 2, 0, "TXE");
+        m.store8(SPI1_DATAR, byte).unwrap();
+        assert_ne!(m.load32(SPI1_STATR).unwrap() & 1, 0, "RXNE");
+        m.load8(SPI1_DATAR).unwrap()
+    }
+
+    fn adc_read(m: &mut Machine, reg: u8, n: usize) -> Vec<u8> {
+        m.store32(GPIOA_BSHR, 1 << (16 + 4)).unwrap(); // CS low
+        xfer(m, 0x80 | reg);
+        let out = (0..n).map(|_| xfer(m, 0)).collect();
+        m.store32(GPIOA_BSHR, 1 << 4).unwrap();
+        out
+    }
+
+    #[test]
+    fn spi_adc_setup_then_conversion_reaches_the_firmware() {
+        let (mut m, id) = spi_adc_machine();
+        assert_eq!(id, "ADC0");
+        assert_eq!(adc_read(&mut m, SimAdc::REG_ID, 1), vec![0xAD]);
+        assert_eq!(adc_read(&mut m, SimAdc::REG_STATUS, 1), vec![0x00]);
+
+        m.set_device("ADC0", "ch2", 2.0).unwrap();
+        m.store32(GPIOA_BSHR, 1 << 20).unwrap();
+        xfer(&mut m, SimAdc::REG_CONFIG);
+        xfer(&mut m, SimAdc::CONFIG_PWR | (2 << 4));
+        m.store32(GPIOA_BSHR, 1 << 4).unwrap();
+        assert_eq!(adc_read(&mut m, SimAdc::REG_STATUS, 1), vec![0x01]);
+
+        m.now += SimAdc::STARTUP_CYCLES;
+        assert_eq!(adc_read(&mut m, SimAdc::REG_STATUS, 1), vec![0x81]);
+        let data = adc_read(&mut m, SimAdc::REG_DATA, 2);
+        let code = u16::from_be_bytes([data[0], data[1]]);
+        assert_eq!(code, (2.0f64 / 3.3 * 4095.0).round() as u16);
+
+        // With CS high the ADC ignores the bus and MISO idles high.
+        assert_eq!(xfer(&mut m, 0x80), 0xff);
+        let view = m
+            .peripherals()
+            .into_iter()
+            .find(|p| p.id == "ADC0")
+            .unwrap();
+        assert!(view.action.contains("SPI1"), "{}", view.action);
+    }
+
+    #[test]
+    fn reverse_step_undoes_an_spi_transfer() {
+        let (mut m, _) = spi_adc_machine();
+        m.store32(GPIOA_BSHR, 1 << 20).unwrap();
+        m.flash[..4].copy_from_slice(&0x0011_2023u32.to_le_bytes()); // sw x1, 0(x2)
+        m.cpu.pc = FLASH_BASE;
+        m.cpu.x[1] = 0x80 | SimAdc::REG_ID as u32;
+        m.cpu.x[2] = SPI1_DATAR;
+        m.step().unwrap();
+        assert_eq!(m.spi[0].frames, 1);
+        assert!(m.reverse_step());
+        assert_eq!(m.spi[0].frames, 0);
+        // The ADC is back to waiting for a command, so the same store reads the ID again.
+        m.step().unwrap();
+        m.load8(SPI1_DATAR).unwrap();
+        assert_eq!(xfer(&mut m, 0), 0xAD);
+    }
+
+    #[derive(Clone, Default)]
+    struct Echo {
+        heard: Vec<u8>,
+        queue: Vec<u8>,
+    }
+
+    impl Component for Echo {
+        fn kind(&self) -> &'static str {
+            "echo"
+        }
+        fn view(&self, _: &DeviceCtx) -> DeviceView {
+            DeviceView::default()
+        }
+    }
+
+    impl UartDevice for Echo {
+        fn receive(&mut self, byte: u8, _: &DeviceCtx) {
+            self.heard.push(byte);
+            self.queue.push(byte.to_ascii_uppercase());
+        }
+        fn has_byte(&self, _: &DeviceCtx) -> bool {
+            !self.queue.is_empty()
+        }
+        fn take_byte(&mut self, _: &DeviceCtx) -> u8 {
+            self.queue.remove(0)
+        }
+        fn clone_box(&self) -> Box<dyn UartDevice> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[test]
+    fn uart_component_hears_tx_and_answers_on_rx() {
+        let mut m = Machine::new();
+        m.attach_uart(Box::new(Echo::default()));
+        m.store32(USART1_BASE + 0x0c, (1 << 13) | (1 << 3) | (1 << 2))
+            .unwrap();
+        m.store8(USART1_BASE + 0x04, b'a').unwrap();
+        m.flash[0] = 0x6f; // jal x0, 0
+        m.cpu.pc = FLASH_BASE;
+        m.step().unwrap();
+        assert_ne!(m.load32(USART1_BASE).unwrap() & USART_RXNE, 0);
+        assert_eq!(m.load8(USART1_BASE + 0x04).unwrap(), b'A');
+        assert_eq!(m.load32(USART1_BASE).unwrap() & USART_RXNE, 0);
+        assert_eq!(m.uart_tx, "a");
+    }
+
+    #[derive(Clone, Default)]
+    struct Reg8 {
+        pointer: u8,
+        regs: [u8; 4],
+        stops: u32,
+        first: bool,
+    }
+
+    impl Component for Reg8 {
+        fn kind(&self) -> &'static str {
+            "reg8"
+        }
+        fn view(&self, _: &DeviceCtx) -> DeviceView {
+            DeviceView::default()
+        }
+    }
+
+    impl I2cDevice for Reg8 {
+        fn address(&self) -> u8 {
+            0x48
+        }
+        fn start(&mut self, read: bool, _: &DeviceCtx) -> bool {
+            self.first = !read;
+            true
+        }
+        fn write(&mut self, byte: u8, _: &DeviceCtx) -> bool {
+            if self.first {
+                self.pointer = byte & 3;
+                self.first = false;
+            } else {
+                self.regs[self.pointer as usize] = byte;
+                self.pointer = (self.pointer + 1) & 3;
+            }
+            true
+        }
+        fn read(&mut self, _: &DeviceCtx) -> u8 {
+            let value = self.regs[self.pointer as usize];
+            self.pointer = (self.pointer + 1) & 3;
+            value
+        }
+        fn stop(&mut self, _: &DeviceCtx) {
+            self.stops += 1;
+        }
+        fn clone_box(&self) -> Box<dyn I2cDevice> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[test]
+    fn i2c_write_then_read_follows_the_hal_sequence() {
+        let base = I2C_BASES[0];
+        let star1 = base + 0x14;
+        let star2 = base + 0x18;
+        let data = base + 0x10;
+        let ctlr1 = base;
+        let mut m = Machine::new();
+        m.attach_i2c(0, Box::new(Reg8::default()));
+        m.store32(RCC_BASE + 0x1c, 1 << 21).unwrap();
+        m.store32(ctlr1, 1).unwrap();
+
+        // Write register 1 = 0x5a, register 2 = 0xa5.
+        m.store32(ctlr1, 1 | (1 << 8)).unwrap();
+        assert_ne!(m.load32(star1).unwrap() & 1, 0, "SB");
+        m.store32(data, 0x48 << 1).unwrap();
+        assert_ne!(m.load32(star1).unwrap() & 2, 0, "ADDR");
+        m.load32(star2).unwrap();
+        for byte in [1u32, 0x5a, 0xa5] {
+            assert_ne!(m.load32(star1).unwrap() & (1 << 7), 0, "TxE");
+            m.store32(data, byte).unwrap();
+            assert_ne!(m.load32(star1).unwrap() & (1 << 2), 0, "BTF");
+        }
+        m.store32(ctlr1, 1 | (1 << 9)).unwrap();
+
+        // Point at register 1, repeated START, read two bytes.
+        m.store32(ctlr1, 1 | (1 << 8)).unwrap();
+        m.store32(data, 0x48 << 1).unwrap();
+        m.load32(star2).unwrap();
+        m.store32(data, 1).unwrap();
+        m.store32(ctlr1, 1 | (1 << 8) | (1 << 10)).unwrap();
+        m.store32(data, (0x48 << 1) | 1).unwrap();
+        assert_ne!(m.load32(star1).unwrap() & 2, 0, "ADDR");
+        m.load32(star2).unwrap();
+        assert_eq!(m.load32(data).unwrap(), 0x5a);
+        m.store32(ctlr1, 1 | (1 << 9)).unwrap();
+        assert_ne!(m.load32(star1).unwrap() & (1 << 6), 0, "RxNE");
+        assert_eq!(m.load32(data).unwrap(), 0xa5);
+
+        // Nobody answers at 0x50.
+        m.store32(ctlr1, 1 | (1 << 8)).unwrap();
+        m.store32(data, 0x50 << 1).unwrap();
+        assert_ne!(m.load32(star1).unwrap() & (1 << 10), 0, "AF");
+        let Link::I2c { dev, .. } = &m.devices[0].link else {
+            panic!()
+        };
+        assert_eq!(dev.address(), 0x48);
     }
 }
