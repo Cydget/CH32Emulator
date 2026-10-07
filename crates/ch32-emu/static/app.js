@@ -9,10 +9,28 @@ const drive = document.querySelector("#drive");
 const driveTitle = document.querySelector("#drive-title");
 const analog = document.querySelector("#analog");
 const analogReadout = document.querySelector("#analog-readout");
+const speedSelect = document.querySelector("#speed");
+const speedActual = document.querySelector("#speed-actual");
+const periGroup = document.querySelector("#peri-group");
+const periId = document.querySelector("#peri-id");
+const periAction = document.querySelector("#peri-action");
+const periInputs = document.querySelector("#peri-inputs");
+const periEffects = document.querySelector("#peri-effects");
+const periOutputs = document.querySelector("#peri-outputs");
+const periOutputsWrap = document.querySelector("#peri-outputs-wrap");
+const stepBtn = document.querySelector("#step");
+const untilBtn = document.querySelector("#until");
+const backBtn = document.querySelector("#back");
+const breakSymbol = document.querySelector("#break-symbol");
+const breakKind = document.querySelector("#break-kind");
+const breakValue = document.querySelector("#break-value");
+const breakValueLabel = document.querySelector("#break-value-label");
 
 let socket;
 let latest = null;
 let selected = null;
+let speedSynced = false;
+let periMenuReady = false;
 const colors = ["#3dd68c", "#6cb6ff", "#e6c15a", "#c084fc", "#f07178", "#7fd1c3"];
 
 function connect() {
@@ -34,12 +52,47 @@ function send(msg) {
   }
 }
 
-document.querySelector("#run").onclick = () => send({ op: "run" });
+document.querySelector("#run").onclick = () => {
+  sendBreakpoint();
+  send({ op: "run" });
+};
 document.querySelector("#pause").onclick = () => send({ op: "pause" });
-document.querySelector("#step").onclick = () => send({ op: "step", count: 1 });
+stepBtn.onclick = () => {
+  sendBreakpoint();
+  send({ op: "step", count: 1 });
+};
+untilBtn.onclick = () => {
+  sendBreakpoint();
+  send({ op: "until" });
+};
+backBtn.onclick = () => send({ op: "back" });
 document.querySelector("#reset").onclick = () => send({ op: "reset" });
-document.querySelector("#speed").onchange = (event) => {
+breakKind.onchange = () => {
+  refreshBreakControls();
+  sendBreakpoint();
+};
+breakSymbol.onchange = () => {
+  refreshBreakControls();
+  sendBreakpoint();
+};
+breakValue.onchange = () => sendBreakpoint();
+speedSelect.onchange = (event) => {
+  speedSynced = true;
   send({ op: "speed", hz: Number(event.target.value) });
+  if (Number(event.target.value) === 0) {
+    speedActual.textContent = latest && latest.running ? "measuring…" : "stopped";
+  } else {
+    speedActual.textContent = "";
+  }
+};
+periGroup.onchange = () => {
+  if (!latest) return;
+  fillPeripherals(latest.peripherals || []);
+  renderPeripheral(latest.peripherals || []);
+};
+periId.onchange = () => {
+  if (!latest) return;
+  renderPeripheral(latest.peripherals || []);
 };
 document.querySelector("#elf").onchange = async (event) => {
   const file = event.target.files[0];
@@ -81,6 +134,7 @@ function render(snap) {
   coreEl.innerHTML = [
     ["pc", hex(snap.pc)],
     ["insn", snap.insn],
+    ["does", snap.effect || ""],
     ["sp", hex(snap.sp)],
     ["cycles", String(snap.cycles)],
     ["mstatus", hex(snap.mstatus)],
@@ -92,6 +146,132 @@ function render(snap) {
   renderPins(snap.pins || []);
   renderSymbols(snap.symbols || []);
   drawGraph(snap.history || []);
+  renderSpeed(snap);
+  renderPeripheral(snap.peripherals || []);
+  const saved = Number(snap.undo) || 0;
+  backBtn.disabled = saved === 0;
+  backBtn.textContent = saved ? `Back (${saved})` : "Back";
+}
+
+function refreshBreakControls() {
+  const armed = breakKind.value !== "off" && breakSymbol.value;
+  untilBtn.disabled = !armed;
+  breakValueLabel.hidden = breakKind.value !== "eq";
+}
+
+function sendBreakpoint() {
+  send({
+    op: "breakpoint",
+    break_name: breakSymbol.value,
+    break_kind: breakKind.value,
+    break_value: Number(breakValue.value || 0),
+  });
+}
+
+function renderSpeed(snap) {
+  if (!speedSynced && snap.hz !== undefined && snap.hz !== null) {
+    const hz = String(snap.hz);
+    if (![...speedSelect.options].some((option) => option.value === hz)) {
+      const option = document.createElement("option");
+      option.value = hz;
+      option.textContent = formatHz(Number(snap.hz));
+      speedSelect.appendChild(option);
+    }
+    speedSelect.value = hz;
+    speedSynced = true;
+  }
+  if (Number(speedSelect.value) !== 0) {
+    speedActual.textContent = "";
+    return;
+  }
+  if (!snap.running) {
+    speedActual.textContent = "stopped";
+    return;
+  }
+  const hz = Number(snap.actual_hz);
+  speedActual.textContent = hz > 0 ? `running at ${formatHz(hz)}` : "measuring…";
+}
+
+function formatHz(hz) {
+  if (hz >= 1_000_000) {
+    const digits = hz >= 10_000_000 ? 1 : 2;
+    return `${(hz / 1_000_000).toFixed(digits)} MHz`;
+  }
+  if (hz >= 1_000) {
+    const digits = hz >= 10_000 ? 1 : 2;
+    return `${(hz / 1_000).toFixed(digits)} kHz`;
+  }
+  return `${Math.round(hz)} Hz`;
+}
+
+function fillPeripherals(list) {
+  const group = periGroup.value;
+  const items = list.filter((item) => item.group === group);
+  const previous = periId.value;
+  periId.innerHTML = items
+    .map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.id)}</option>`)
+    .join("");
+  if (items.some((item) => item.id === previous)) periId.value = previous;
+}
+
+function renderPeripheral(list) {
+  if (!list.length) return;
+  if (!periMenuReady) {
+    const groups = [];
+    for (const item of list) {
+      if (!groups.includes(item.group)) groups.push(item.group);
+    }
+    periGroup.innerHTML = groups
+      .map((group) => `<option value="${escapeHtml(group)}">${escapeHtml(group)}</option>`)
+      .join("");
+    if (groups.includes("TIM")) periGroup.value = "TIM";
+    fillPeripherals(list);
+    if ([...periId.options].some((option) => option.value === "TIM2")) periId.value = "TIM2";
+    periMenuReady = true;
+  }
+  const peripheral = list.find((item) => item.id === periId.value) || list[0];
+  periAction.textContent = peripheral.action;
+  periInputs.innerHTML = signalTable(peripheral.inputs);
+  periEffects.innerHTML = effectTable(peripheral.effects);
+  const outputs = peripheral.outputs || [];
+  periOutputsWrap.hidden = outputs.length === 0;
+  if (outputs.length) periOutputs.innerHTML = signalTable(outputs);
+}
+
+function signalTable(rows) {
+  const body = (rows || [])
+    .map(
+      (row) =>
+        `<tr><td>${escapeHtml(row.name)}</td><td>${addr(row.address)}</td><td>${escapeHtml(row.value)}</td></tr>`,
+    )
+    .join("");
+  return `<thead><tr><th>Name</th><th>Address</th><th>Value</th></tr></thead><tbody>${
+    body || `<tr><td colspan="3">(none)</td></tr>`
+  }</tbody>`;
+}
+
+function effectTable(rows) {
+  const body = (rows || [])
+    .map(
+      (row) =>
+        `<tr><td>${escapeHtml(row.name)}</td><td>${addr(row.address)}</td><td>${formatNum(row["old"])}</td><td>${formatNum(row["new"])}</td><td>${escapeHtml(row.bits)}</td></tr>`,
+    )
+    .join("");
+  return `<thead><tr><th>Name</th><th>Address</th><th>Old</th><th>New</th><th>Bits</th></tr></thead><tbody>${
+    body || `<tr><td colspan="5">No memory changes this step.</td></tr>`
+  }</tbody>`;
+}
+
+function addr(value) {
+  if (value === null || value === undefined) return "—";
+  return hex(value);
+}
+
+function formatNum(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return escapeHtml(value);
+  if (number <= 0xffffffff) return `${number} (${hex(number)})`;
+  return String(number);
 }
 
 function renderPins(pins) {
@@ -144,11 +324,19 @@ function renderSymbols(symbols) {
     if (symbolsEl.dataset.count !== "0") {
       symbolsEl.dataset.count = "0";
       symbolsEl.textContent = "Load an ELF to list statics in SRAM.";
+      breakSymbol.innerHTML = "";
+      refreshBreakControls();
     }
     return;
   }
   if (symbolsEl.dataset.count !== String(symbols.length)) {
     symbolsEl.dataset.count = String(symbols.length);
+    const previous = breakSymbol.value;
+    breakSymbol.innerHTML = symbols
+      .map((symbol) => `<option value="${escapeHtml(symbol.name)}">${escapeHtml(symbol.name)}</option>`)
+      .join("");
+    if (symbols.some((symbol) => symbol.name === previous)) breakSymbol.value = previous;
+    refreshBreakControls();
     symbolsEl.innerHTML = "";
     for (const symbol of symbols) {
       const row = document.createElement("label");

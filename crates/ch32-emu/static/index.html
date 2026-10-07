@@ -20,6 +20,8 @@
       <button id="run" type="button">Run</button>
       <button id="pause" type="button">Pause</button>
       <button id="step" type="button">Step</button>
+      <button id="until" type="button" disabled title="Run until the static breakpoint.">Step to break</button>
+      <button id="back" type="button" title="Reverse one instruction. The last 10 cycles are kept.">Back</button>
       <button id="reset" type="button">Reset</button>
       <label>Speed
         <select id="speed">
@@ -28,6 +30,7 @@
           <option value="100000">100 kHz</option>
           <option value="0">Unlimited</option>
         </select>
+        <span id="speed-actual"></span>
       </label>
     </div>
   </header>
@@ -55,9 +58,54 @@
     </section>
     <section class="panel vars-panel">
       <h2>Static variables</h2>
-      <p class="hint">Symbols in SRAM from the ELF. Checked variables are sampled while the core runs and drawn on the graph.</p>
+      <p class="hint">Symbols in SRAM from the ELF. Checked variables are sampled while the core runs and drawn on the graph. Choose a break, then Step to break runs until that static increments, decrements, or becomes the value you enter. Step still advances one instruction. Run stops on the same transition. Back reverses one instruction, up to 10 cycles.</p>
+      <div class="break-row">
+        <label>Break
+          <select id="break-symbol"></select>
+        </label>
+        <label>
+          <select id="break-kind">
+            <option value="off">Off</option>
+            <option value="inc">Increments</option>
+            <option value="dec">Decrements</option>
+            <option value="eq">Equals</option>
+          </select>
+        </label>
+        <label id="break-value-label" hidden>Value
+          <input id="break-value" type="number" step="1" value="0">
+        </label>
+      </div>
       <div id="symbols"></div>
       <canvas id="graph" width="720" height="260"></canvas>
+    </section>
+    <section class="panel peripheral-panel">
+      <div class="panel-head">
+        <h2>Peripherals</h2>
+        <div class="peri-menu">
+          <label>Group
+            <select id="peri-group"></select>
+          </label>
+          <label>Peripheral
+            <select id="peri-id"></select>
+          </label>
+        </div>
+      </div>
+      <p class="hint">Pick a peripheral from the menu. Inputs are the registers and signals it is using. Changes this step are what its next update will write. A register change shows the address, the old value, and the new value. That update is the peripheral's own step, separate from the instruction about to execute.</p>
+      <p id="peri-action"></p>
+      <div class="peri-columns">
+        <div>
+          <h3>Inputs</h3>
+          <div class="peri-scroll"><table id="peri-inputs"></table></div>
+        </div>
+        <div>
+          <h3>Changes this step</h3>
+          <div class="peri-scroll"><table id="peri-effects"></table></div>
+          <div id="peri-outputs-wrap">
+            <h3>Outputs</h3>
+            <div class="peri-scroll"><table id="peri-outputs"></table></div>
+          </div>
+        </div>
+      </div>
     </section>
   </main>
   <script src="/app.js"></script>

@@ -110,6 +110,34 @@ impl Default for Cpu {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct CpuScalars {
+    x: [u32; 32],
+    pc: u32,
+    mstatus: u32,
+    mtvec: u32,
+    mscratch: u32,
+    mepc: u32,
+    mcause: u32,
+    mtval: u32,
+    mie: u32,
+    mip: u32,
+    intsyscr: u32,
+    corecfgr: u32,
+    cycle: u64,
+    instret: u64,
+    hw_frames: u32,
+    trace: bool,
+    mie_steps: u64,
+    irqs_taken: u64,
+}
+
+pub(crate) struct CpuHeap {
+    custom_csr: std::collections::HashMap<u16, u32>,
+    mie_stack: Vec<bool>,
+    serving: Vec<u32>,
+}
+
 impl Cpu {
     pub fn reset(&mut self, entry: u32) {
         let trace = self.trace;
@@ -119,7 +147,11 @@ impl Cpu {
     }
 
     pub fn x(&self, i: usize) -> u32 {
-        if i == 0 { 0 } else { self.x[i] }
+        if i == 0 {
+            0
+        } else {
+            self.x[i]
+        }
     }
 
     fn set_x(&mut self, i: usize, val: u32) {
@@ -136,12 +168,80 @@ impl Cpu {
         self.serving.len()
     }
 
+    pub fn is_serving(&self, irq: u32) -> bool {
+        self.serving.contains(&irq)
+    }
+
     pub fn hw_frames(&self) -> u32 {
         self.hw_frames
     }
 
     pub fn hw_stack_enabled(&self) -> bool {
         self.intsyscr & 1 != 0
+    }
+
+    pub(crate) fn checkpoint(&self) -> (CpuScalars, Option<CpuHeap>) {
+        let scalars = CpuScalars {
+            x: self.x,
+            pc: self.pc,
+            mstatus: self.mstatus,
+            mtvec: self.mtvec,
+            mscratch: self.mscratch,
+            mepc: self.mepc,
+            mcause: self.mcause,
+            mtval: self.mtval,
+            mie: self.mie,
+            mip: self.mip,
+            intsyscr: self.intsyscr,
+            corecfgr: self.corecfgr,
+            cycle: self.cycle,
+            instret: self.instret,
+            hw_frames: self.hw_frames,
+            trace: self.trace,
+            mie_steps: self.mie_steps,
+            irqs_taken: self.irqs_taken,
+        };
+        let heap =
+            if self.custom_csr.is_empty() && self.mie_stack.is_empty() && self.serving.is_empty() {
+                None
+            } else {
+                Some(CpuHeap {
+                    custom_csr: self.custom_csr.clone(),
+                    mie_stack: self.mie_stack.clone(),
+                    serving: self.serving.clone(),
+                })
+            };
+        (scalars, heap)
+    }
+
+    pub(crate) fn restore(&mut self, scalars: CpuScalars, heap: Option<CpuHeap>) {
+        self.x = scalars.x;
+        self.pc = scalars.pc;
+        self.mstatus = scalars.mstatus;
+        self.mtvec = scalars.mtvec;
+        self.mscratch = scalars.mscratch;
+        self.mepc = scalars.mepc;
+        self.mcause = scalars.mcause;
+        self.mtval = scalars.mtval;
+        self.mie = scalars.mie;
+        self.mip = scalars.mip;
+        self.intsyscr = scalars.intsyscr;
+        self.corecfgr = scalars.corecfgr;
+        self.cycle = scalars.cycle;
+        self.instret = scalars.instret;
+        self.hw_frames = scalars.hw_frames;
+        self.trace = scalars.trace;
+        self.mie_steps = scalars.mie_steps;
+        self.irqs_taken = scalars.irqs_taken;
+        if let Some(heap) = heap {
+            self.custom_csr = heap.custom_csr;
+            self.mie_stack = heap.mie_stack;
+            self.serving = heap.serving;
+        } else {
+            self.custom_csr.clear();
+            self.mie_stack.clear();
+            self.serving.clear();
+        }
     }
 
     /// Execute one instruction, then take a pending interrupt if the core is enabled.
@@ -290,10 +390,7 @@ impl Cpu {
         if let Some(irq) = self.serving.pop() {
             bus.note_irq_active(irq, false);
         }
-        let restore = self
-            .mie_stack
-            .pop()
-            .unwrap_or((self.mstatus >> 7) & 1 == 1);
+        let restore = self.mie_stack.pop().unwrap_or((self.mstatus >> 7) & 1 == 1);
         self.mstatus = (self.mstatus & !0x8) | (u32::from(restore) << 3);
         self.mstatus |= 0x80;
         self.pc = self.mepc;
@@ -422,11 +519,23 @@ impl Cpu {
                     (4, 1) => div_s(a, b),
                     (5, 0) => a >> (b & 0x1f),
                     (5, 0x20) => ((a as i32) >> (b & 0x1f)) as u32,
-                    (5, 1) => if b == 0 { 0xffff_ffff } else { a / b },
+                    (5, 1) => {
+                        if b == 0 {
+                            0xffff_ffff
+                        } else {
+                            a / b
+                        }
+                    }
                     (6, 0) => a | b,
                     (6, 1) => rem_s(a, b),
                     (7, 0) => a & b,
-                    (7, 1) => if b == 0 { a } else { a % b },
+                    (7, 1) => {
+                        if b == 0 {
+                            a
+                        } else {
+                            a % b
+                        }
+                    }
                     _ => return Err(Fault::IllegalInstruction),
                 };
                 self.set_x(rd, val);
@@ -496,6 +605,10 @@ impl Cpu {
         self.set_x(rd, old);
         self.pc = next;
         Ok(())
+    }
+
+    pub(crate) fn read_csr(&self, csr: u16) -> u32 {
+        self.csr_read(csr)
     }
 
     fn csr_read(&self, csr: u16) -> u32 {
@@ -650,7 +763,7 @@ impl Cpu {
                         self.set_x(rd, self.x(rd) & imm);
                     }
                     3 => {
-                        if inst & (1 << 12) != 0 {
+                        if (inst & (1 << 12)) != 0 {
                             return Err(Fault::IllegalInstruction);
                         }
                         let rs2 = rdp(inst);
@@ -809,30 +922,696 @@ fn c_lui_imm(inst: u16) -> u32 {
     sext((imm17_12 as u32) << 12, 18)
 }
 
-pub fn disasm(inst: u32) -> String {
-    let opcode = inst & 0x7f;
-    let rd = (inst >> 7) & 0x1f;
-    let rs1 = (inst >> 15) & 0x1f;
-    let rs2 = (inst >> 20) & 0x1f;
-    let funct3 = (inst >> 12) & 7;
-    match opcode {
-        0x37 => format!("lui x{rd}, {:#x}", inst >> 12),
-        0x17 => format!("auipc x{rd}, {:#x}", inst >> 12),
-        0x6f => format!("jal x{rd}"),
-        0x67 => format!("jalr x{rd}, x{rs1}"),
-        0x63 => format!("b{funct3} x{rs1}, x{rs2}"),
-        0x03 => format!("l{funct3} x{rd}, x{rs1}"),
-        0x23 => format!("s{funct3} x{rs2}, x{rs1}"),
-        0x13 => format!("opi{funct3} x{rd}, x{rs1}"),
-        0x33 => format!("op{funct3} x{rd}, x{rs1}, x{rs2}"),
-        0x73 => "system".to_string(),
-        0x0f => "fence".to_string(),
-        _ => format!(".word {inst:#010x}"),
+const XN: [&str; 32] = [
+    "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3", "a4",
+    "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4",
+    "t5", "t6",
+];
+
+fn xn(i: usize) -> &'static str {
+    XN[i]
+}
+
+fn rv(regs: &[u32; 32], i: usize) -> u32 {
+    if i == 0 {
+        0
+    } else {
+        regs[i]
     }
 }
 
+fn regv(regs: &[u32; 32], i: usize) -> String {
+    format!("{} ({:#x})", xn(i), rv(regs, i))
+}
+
+fn imm_text(v: u32) -> String {
+    let signed = v as i32;
+    if signed < 0 {
+        signed.to_string()
+    } else {
+        v.to_string()
+    }
+}
+
+fn written(rd: usize, val: u32) -> String {
+    if rd == 0 {
+        format!("result {val:#x} is discarded")
+    } else {
+        format!("{} = {val:#x}", xn(rd))
+    }
+}
+
+fn loaded(rd: usize, got: &str, addr: u32) -> String {
+    if rd == 0 {
+        format!("load {got} from {addr:#010x} is discarded")
+    } else {
+        format!("{} = {got} from {addr:#010x}", xn(rd))
+    }
+}
+
+fn csr_name(csr: u16) -> String {
+    match csr {
+        0x300 => "mstatus".into(),
+        0x301 => "misa".into(),
+        0x304 => "mie".into(),
+        0x305 => "mtvec".into(),
+        0x340 => "mscratch".into(),
+        0x341 => "mepc".into(),
+        0x342 => "mcause".into(),
+        0x343 => "mtval".into(),
+        0x344 => "mip".into(),
+        0x800 => "gintenr".into(),
+        0x804 => "intsyscr".into(),
+        0xbc0 => "corecfgr".into(),
+        0xb00 => "mcycle".into(),
+        0xb80 => "mcycleh".into(),
+        0xb02 => "minstret".into(),
+        0xb82 => "minstreth".into(),
+        0xf11 => "mvendorid".into(),
+        0xf12 => "marchid".into(),
+        0xf13 => "mimpid".into(),
+        0xf14 => "mhartid".into(),
+        other => format!("csr{other:#x}"),
+    }
+}
+
+fn peeked(mem: &dyn Fn(u32, usize) -> Option<u32>, addr: u32, size: usize, signed: bool) -> String {
+    match mem(addr, size) {
+        Some(raw) => {
+            let val = if signed {
+                match size {
+                    1 => sext(raw, 8),
+                    2 => sext(raw, 16),
+                    _ => raw,
+                }
+            } else {
+                raw
+            };
+            format!("{val:#x}")
+        }
+        None => "unmapped".into(),
+    }
+}
+
+/// Assembly text and a description of what the instruction will do with the current registers.
+pub fn explain32(
+    inst: u32,
+    pc: u32,
+    regs: &[u32; 32],
+    csr: &dyn Fn(u16) -> u32,
+    mem: &dyn Fn(u32, usize) -> Option<u32>,
+) -> (String, String) {
+    let opcode = inst & 0x7f;
+    let rd = ((inst >> 7) & 0x1f) as usize;
+    let funct3 = (inst >> 12) & 7;
+    let rs1 = ((inst >> 15) & 0x1f) as usize;
+    let rs2 = ((inst >> 20) & 0x1f) as usize;
+    let funct7 = (inst >> 25) & 0x7f;
+    let imm_i = sext(inst >> 20, 12);
+    let imm_s = sext(((inst >> 25) << 5) | ((inst >> 7) & 0x1f), 12);
+    let imm_b = sext(
+        (((inst >> 31) & 1) << 12)
+            | (((inst >> 7) & 1) << 11)
+            | (((inst >> 25) & 0x3f) << 5)
+            | (((inst >> 8) & 0xf) << 1),
+        13,
+    );
+    let imm_u = inst & 0xffff_f000;
+    let imm_j = sext(
+        (((inst >> 31) & 1) << 20)
+            | (((inst >> 12) & 0xff) << 12)
+            | (((inst >> 20) & 1) << 11)
+            | (((inst >> 21) & 0x3ff) << 1),
+        21,
+    );
+    let next = pc.wrapping_add(4);
+    let illegal = (
+        format!(".word {inst:#010x}"),
+        "illegal instruction".to_string(),
+    );
+    match opcode {
+        0x37 => (
+            format!("lui {}, {:#x}", xn(rd), inst >> 12),
+            written(rd, imm_u),
+        ),
+        0x17 => {
+            let val = pc.wrapping_add(imm_u);
+            (
+                format!("auipc {}, {:#x}", xn(rd), inst >> 12),
+                format!("{} (pc {pc:#010x} + {imm_u:#x})", written(rd, val)),
+            )
+        }
+        0x6f => {
+            let target = pc.wrapping_add(imm_j);
+            let asm = format!("jal {}, {}", xn(rd), imm_text(imm_j));
+            let effect = if rd == 0 {
+                format!("jump to {target:#010x}")
+            } else {
+                format!("{}, jump to {target:#010x}", written(rd, next))
+            };
+            (asm, effect)
+        }
+        0x67 if funct3 == 0 => {
+            let target = rv(regs, rs1).wrapping_add(imm_i) & !1;
+            let asm = format!("jalr {}, {}({})", xn(rd), imm_text(imm_i), xn(rs1));
+            let effect = if rd == 0 {
+                format!("jump to {target:#010x} ({})", regv(regs, rs1))
+            } else {
+                format!(
+                    "{}, jump to {target:#010x} ({})",
+                    written(rd, next),
+                    regv(regs, rs1)
+                )
+            };
+            (asm, effect)
+        }
+        0x63 => {
+            let name = match funct3 {
+                0 => "beq",
+                1 => "bne",
+                4 => "blt",
+                5 => "bge",
+                6 => "bltu",
+                7 => "bgeu",
+                _ => return illegal,
+            };
+            let a = rv(regs, rs1);
+            let b = rv(regs, rs2);
+            let take = match funct3 {
+                0 => a == b,
+                1 => a != b,
+                4 => (a as i32) < (b as i32),
+                5 => (a as i32) >= (b as i32),
+                6 => a < b,
+                _ => a >= b,
+            };
+            let target = if take { pc.wrapping_add(imm_b) } else { next };
+            let rel = match funct3 {
+                0 => {
+                    if take {
+                        "=="
+                    } else {
+                        "!="
+                    }
+                }
+                1 => {
+                    if take {
+                        "!="
+                    } else {
+                        "=="
+                    }
+                }
+                4 => {
+                    if take {
+                        "<"
+                    } else {
+                        ">="
+                    }
+                }
+                5 => {
+                    if take {
+                        ">="
+                    } else {
+                        "<"
+                    }
+                }
+                6 => {
+                    if take {
+                        "<"
+                    } else {
+                        ">="
+                    }
+                }
+                _ => {
+                    if take {
+                        ">="
+                    } else {
+                        "<"
+                    }
+                }
+            };
+            let go = if take { "branch" } else { "continue" };
+            (
+                format!("{name} {}, {}, {}", xn(rs1), xn(rs2), imm_text(imm_b)),
+                format!(
+                    "{} {rel} {}, {go} at {target:#010x}",
+                    regv(regs, rs1),
+                    regv(regs, rs2)
+                ),
+            )
+        }
+        0x03 => {
+            let (name, size, signed) = match funct3 {
+                0 => ("lb", 1, true),
+                1 => ("lh", 2, true),
+                2 => ("lw", 4, false),
+                4 => ("lbu", 1, false),
+                5 => ("lhu", 2, false),
+                _ => return illegal,
+            };
+            let addr = rv(regs, rs1).wrapping_add(imm_i);
+            let got = peeked(mem, addr, size, signed);
+            (
+                format!("{name} {}, {}({})", xn(rd), imm_text(imm_i), xn(rs1)),
+                loaded(rd, &got, addr),
+            )
+        }
+        0x23 => {
+            let (name, size) = match funct3 {
+                0 => ("sb", 1),
+                1 => ("sh", 2),
+                2 => ("sw", 4),
+                _ => return illegal,
+            };
+            let addr = rv(regs, rs1).wrapping_add(imm_s);
+            (
+                format!("{name} {}, {}({})", xn(rs2), imm_text(imm_s), xn(rs1)),
+                format!(
+                    "store {size} byte(s) from {} to {addr:#010x}",
+                    regv(regs, rs2)
+                ),
+            )
+        }
+        0x13 => {
+            let a = rv(regs, rs1);
+            let shamt = imm_i & 0x1f;
+            let (name, val) = match funct3 {
+                0 => ("addi", a.wrapping_add(imm_i)),
+                2 => ("slti", ((a as i32) < (imm_i as i32)) as u32),
+                3 => ("sltiu", (a < imm_i) as u32),
+                4 => ("xori", a ^ imm_i),
+                6 => ("ori", a | imm_i),
+                7 => ("andi", a & imm_i),
+                1 if funct7 == 0 => ("slli", a << shamt),
+                5 if funct7 == 0 => ("srli", a >> shamt),
+                5 if funct7 == 0x20 => ("srai", ((a as i32) >> shamt) as u32),
+                _ => return illegal,
+            };
+            let imm = if matches!(name, "slli" | "srli" | "srai") {
+                shamt.to_string()
+            } else {
+                imm_text(imm_i)
+            };
+            let asm = format!("{name} {}, {}, {imm}", xn(rd), xn(rs1));
+            let effect = if name == "addi" && rd == 0 && rs1 == 0 && imm_i == 0 {
+                "no register changes".into()
+            } else {
+                format!("{} ({})", written(rd, val), regv(regs, rs1))
+            };
+            (asm, effect)
+        }
+        0x33 => {
+            let a = rv(regs, rs1);
+            let b = rv(regs, rs2);
+            let (name, val) = match (funct3, funct7) {
+                (0, 0) => ("add", a.wrapping_add(b)),
+                (0, 0x20) => ("sub", a.wrapping_sub(b)),
+                (0, 1) => ("mul", a.wrapping_mul(b)),
+                (1, 0) => ("sll", a << (b & 0x1f)),
+                (1, 1) => (
+                    "mulh",
+                    (((a as i32 as i64) * (b as i32 as i64)) >> 32) as u32,
+                ),
+                (2, 0) => ("slt", ((a as i32) < (b as i32)) as u32),
+                (2, 1) => (
+                    "mulhsu",
+                    (((a as i32 as i64) * (b as u64 as i64)) >> 32) as u32,
+                ),
+                (3, 0) => ("sltu", (a < b) as u32),
+                (3, 1) => ("mulhu", (((a as u64) * (b as u64)) >> 32) as u32),
+                (4, 0) => ("xor", a ^ b),
+                (4, 1) => ("div", div_s(a, b)),
+                (5, 0) => ("srl", a >> (b & 0x1f)),
+                (5, 0x20) => ("sra", ((a as i32) >> (b & 0x1f)) as u32),
+                (5, 1) => ("divu", if b == 0 { 0xffff_ffff } else { a / b }),
+                (6, 0) => ("or", a | b),
+                (6, 1) => ("rem", rem_s(a, b)),
+                (7, 0) => ("and", a & b),
+                (7, 1) => ("remu", if b == 0 { a } else { a % b }),
+                _ => return illegal,
+            };
+            (
+                format!("{name} {}, {}, {}", xn(rd), xn(rs1), xn(rs2)),
+                format!(
+                    "{} ({} and {})",
+                    written(rd, val),
+                    regv(regs, rs1),
+                    regv(regs, rs2)
+                ),
+            )
+        }
+        0x0f => ("fence".into(), "no register changes".into()),
+        0x73 => explain_system(inst, rd, funct3, rs1, imm_i, next, regs, csr),
+        _ => illegal,
+    }
+}
+
+fn explain_system(
+    inst: u32,
+    rd: usize,
+    funct3: u32,
+    rs1: usize,
+    imm_i: u32,
+    next: u32,
+    regs: &[u32; 32],
+    csr: &dyn Fn(u16) -> u32,
+) -> (String, String) {
+    if funct3 == 0 {
+        return match imm_i {
+            0 => ("ecall".into(), "trap with an environment call".into()),
+            1 => ("ebreak".into(), "trap with a breakpoint".into()),
+            0x302 => (
+                "mret".into(),
+                format!(
+                    "return to mepc ({:#010x}) and restore interrupt enable",
+                    csr(0x341)
+                ),
+            ),
+            0x105 => ("wfi".into(), format!("wait, then continue at {next:#010x}")),
+            _ => (format!(".word {inst:#010x}"), "illegal instruction".into()),
+        };
+    }
+    let csr_id = (imm_i & 0xfff) as u16;
+    let name = match funct3 {
+        1 => "csrrw",
+        2 => "csrrs",
+        3 => "csrrc",
+        5 => "csrrwi",
+        6 => "csrrsi",
+        7 => "csrrci",
+        _ => return (format!(".word {inst:#010x}"), "illegal instruction".into()),
+    };
+    let old = csr(csr_id);
+    let src = if funct3 < 5 {
+        regv(regs, rs1)
+    } else {
+        format!("imm {}", rs1)
+    };
+    let new = match funct3 {
+        1 => rv(regs, rs1),
+        2 => old | rv(regs, rs1),
+        3 => old & !rv(regs, rs1),
+        5 => rs1 as u32,
+        6 => old | (rs1 as u32),
+        7 => old & !(rs1 as u32),
+        _ => 0,
+    };
+    let writes = !matches!(funct3, 2 | 3 | 6 | 7) || rs1 != 0;
+    let cname = csr_name(csr_id);
+    let asm = if funct3 < 5 {
+        format!("{name} {}, {cname}, {}", xn(rd), xn(rs1))
+    } else {
+        format!("{name} {}, {cname}, {rs1}", xn(rd))
+    };
+    let effect = if writes {
+        format!(
+            "{}, {cname} = {new:#x} (was {old:#x}, source {src})",
+            written(rd, old)
+        )
+    } else {
+        format!("{}, {cname} stays {old:#x}", written(rd, old))
+    };
+    (asm, effect)
+}
+
+pub fn explain_c(
+    inst: u16,
+    pc: u32,
+    regs: &[u32; 32],
+    mem: &dyn Fn(u32, usize) -> Option<u32>,
+) -> (String, String) {
+    let op = inst & 0b11;
+    let funct3 = (inst >> 13) & 0b111;
+    let next = pc.wrapping_add(2);
+    let rdp = |i: u16| (((i >> 2) & 0x7) + 8) as usize;
+    let rs1p = |i: u16| (((i >> 7) & 0x7) + 8) as usize;
+    let illegal = (
+        format!(".half {inst:04x}"),
+        "illegal instruction".to_string(),
+    );
+    match (op, funct3) {
+        (0, 0) => {
+            let rd = rdp(inst);
+            let imm = ((((inst >> 11) & 0x3) as u32) << 4)
+                | ((((inst >> 7) & 0xf) as u32) << 6)
+                | ((((inst >> 6) & 1) as u32) << 2)
+                | ((((inst >> 5) & 1) as u32) << 3);
+            if imm == 0 {
+                return illegal;
+            }
+            let val = rv(regs, 2).wrapping_add(imm);
+            (
+                format!("c.addi4spn {}, sp, {imm}", xn(rd)),
+                format!("{} ({})", written(rd, val), regv(regs, 2)),
+            )
+        }
+        (0, 2) => {
+            let rd = rdp(inst);
+            let rs1 = rs1p(inst);
+            let off = ((((inst >> 10) & 0x7) as u32) << 3)
+                | ((((inst >> 6) & 1) as u32) << 2)
+                | ((((inst >> 5) & 1) as u32) << 6);
+            let addr = rv(regs, rs1).wrapping_add(off);
+            (
+                format!("c.lw {}, {off}({})", xn(rd), xn(rs1)),
+                loaded(rd, &peeked(mem, addr, 4, false), addr),
+            )
+        }
+        (0, 6) => {
+            let rs2 = rdp(inst);
+            let rs1 = rs1p(inst);
+            let off = ((((inst >> 10) & 0x7) as u32) << 3)
+                | ((((inst >> 6) & 1) as u32) << 2)
+                | ((((inst >> 5) & 1) as u32) << 6);
+            let addr = rv(regs, rs1).wrapping_add(off);
+            (
+                format!("c.sw {}, {off}({})", xn(rs2), xn(rs1)),
+                format!("store 4 byte(s) from {} to {addr:#010x}", regv(regs, rs2)),
+            )
+        }
+        (1, 0) => {
+            let rd = ((inst >> 7) & 0x1f) as usize;
+            let imm = c_imm_i(inst);
+            if rd == 0 && imm == 0 {
+                return ("c.nop".into(), "no register changes".into());
+            }
+            let val = rv(regs, rd).wrapping_add(imm);
+            (
+                format!("c.addi {}, {}", xn(rd), imm_text(imm)),
+                format!("{} ({})", written(rd, val), regv(regs, rd)),
+            )
+        }
+        (1, 1) => {
+            let imm = c_j_imm(inst);
+            let target = pc.wrapping_add(imm);
+            (
+                format!("c.jal {}", imm_text(imm)),
+                format!("{}, jump to {target:#010x}", written(1, next)),
+            )
+        }
+        (1, 2) => {
+            let rd = ((inst >> 7) & 0x1f) as usize;
+            let imm = c_imm_i(inst);
+            (
+                format!("c.li {}, {}", xn(rd), imm_text(imm)),
+                written(rd, imm),
+            )
+        }
+        (1, 3) => {
+            let rd = ((inst >> 7) & 0x1f) as usize;
+            if rd == 2 {
+                let imm = c_addi16sp_imm(inst);
+                if imm == 0 {
+                    return illegal;
+                }
+                let val = rv(regs, 2).wrapping_add(imm);
+                (
+                    format!("c.addi16sp {}", imm_text(imm)),
+                    format!("{} ({})", written(2, val), regv(regs, 2)),
+                )
+            } else if rd != 0 {
+                let imm = c_lui_imm(inst);
+                if imm == 0 {
+                    return illegal;
+                }
+                (
+                    format!("c.lui {}, {:#x}", xn(rd), imm >> 12),
+                    written(rd, imm),
+                )
+            } else {
+                illegal
+            }
+        }
+        (1, 4) => {
+            let rd = rs1p(inst);
+            let funct2 = (inst >> 10) & 0b11;
+            match funct2 {
+                0 | 1 => {
+                    let shamt = ((inst >> 2) & 0x1f) as u32;
+                    if (inst & (1 << 12)) != 0 {
+                        return illegal;
+                    }
+                    let name = if funct2 == 0 { "c.srli" } else { "c.srai" };
+                    let val = if funct2 == 0 {
+                        rv(regs, rd) >> shamt
+                    } else {
+                        ((rv(regs, rd) as i32) >> shamt) as u32
+                    };
+                    (
+                        format!("{name} {}, {shamt}", xn(rd)),
+                        format!("{} ({})", written(rd, val), regv(regs, rd)),
+                    )
+                }
+                2 => {
+                    let imm = c_imm_i(inst);
+                    let val = rv(regs, rd) & imm;
+                    (
+                        format!("c.andi {}, {}", xn(rd), imm_text(imm)),
+                        format!("{} ({})", written(rd, val), regv(regs, rd)),
+                    )
+                }
+                3 => {
+                    if (inst & (1 << 12)) != 0 {
+                        return illegal;
+                    }
+                    let rs2 = rdp(inst);
+                    let op = (inst >> 5) & 0b11;
+                    let a = rv(regs, rd);
+                    let b = rv(regs, rs2);
+                    let (name, val) = match op {
+                        0 => ("c.sub", a.wrapping_sub(b)),
+                        1 => ("c.xor", a ^ b),
+                        2 => ("c.or", a | b),
+                        _ => ("c.and", a & b),
+                    };
+                    (
+                        format!("{name} {}, {}", xn(rd), xn(rs2)),
+                        format!(
+                            "{} ({} and {})",
+                            written(rd, val),
+                            regv(regs, rd),
+                            regv(regs, rs2)
+                        ),
+                    )
+                }
+                _ => unreachable!(),
+            }
+        }
+        (1, 5) => {
+            let imm = c_j_imm(inst);
+            let target = pc.wrapping_add(imm);
+            (
+                format!("c.j {}", imm_text(imm)),
+                format!("jump to {target:#010x}"),
+            )
+        }
+        (1, 6) | (1, 7) => {
+            let rs1 = rs1p(inst);
+            let imm = c_b_imm(inst);
+            let name = if funct3 == 6 { "c.beqz" } else { "c.bnez" };
+            let take = if funct3 == 6 {
+                rv(regs, rs1) == 0
+            } else {
+                rv(regs, rs1) != 0
+            };
+            let target = if take { pc.wrapping_add(imm) } else { next };
+            let go = if take { "branch" } else { "continue" };
+            (
+                format!("{name} {}, {}", xn(rs1), imm_text(imm)),
+                format!("{}, {go} at {target:#010x}", regv(regs, rs1)),
+            )
+        }
+        (2, 0) => {
+            let rd = ((inst >> 7) & 0x1f) as usize;
+            let shamt = (((inst >> 12) & 1) << 5 | ((inst >> 2) & 0x1f)) as u32;
+            if shamt & 0x20 != 0 {
+                return illegal;
+            }
+            let val = rv(regs, rd) << shamt;
+            (
+                format!("c.slli {}, {shamt}", xn(rd)),
+                format!("{} ({})", written(rd, val), regv(regs, rd)),
+            )
+        }
+        (2, 2) => {
+            let rd = ((inst >> 7) & 0x1f) as usize;
+            if rd == 0 {
+                return illegal;
+            }
+            let off = ((((inst >> 12) & 1) as u32) << 5)
+                | ((((inst >> 4) & 0x7) as u32) << 2)
+                | ((((inst >> 2) & 0x3) as u32) << 6);
+            let addr = rv(regs, 2).wrapping_add(off);
+            (
+                format!("c.lwsp {}, {off}(sp)", xn(rd)),
+                loaded(rd, &peeked(mem, addr, 4, false), addr),
+            )
+        }
+        (2, 4) => {
+            let rd = ((inst >> 7) & 0x1f) as usize;
+            let rs2 = ((inst >> 2) & 0x1f) as usize;
+            let bit12 = (inst >> 12) & 1;
+            if bit12 == 0 {
+                if rs2 == 0 {
+                    if rd == 0 {
+                        return illegal;
+                    }
+                    let target = rv(regs, rd) & !1;
+                    (
+                        format!("c.jr {}", xn(rd)),
+                        format!("jump to {target:#010x} ({})", regv(regs, rd)),
+                    )
+                } else {
+                    (
+                        format!("c.mv {}, {}", xn(rd), xn(rs2)),
+                        format!("{} ({})", written(rd, rv(regs, rs2)), regv(regs, rs2)),
+                    )
+                }
+            } else if rs2 == 0 {
+                if rd == 0 {
+                    return ("c.ebreak".into(), "trap with a breakpoint".into());
+                }
+                let target = rv(regs, rd) & !1;
+                (
+                    format!("c.jalr {}", xn(rd)),
+                    format!(
+                        "{}, jump to {target:#010x} ({})",
+                        written(1, next),
+                        regv(regs, rd)
+                    ),
+                )
+            } else {
+                let val = rv(regs, rd).wrapping_add(rv(regs, rs2));
+                (
+                    format!("c.add {}, {}", xn(rd), xn(rs2)),
+                    format!(
+                        "{} ({} and {})",
+                        written(rd, val),
+                        regv(regs, rd),
+                        regv(regs, rs2)
+                    ),
+                )
+            }
+        }
+        (2, 6) => {
+            let rs2 = ((inst >> 2) & 0x1f) as usize;
+            let off = ((((inst >> 9) & 0xf) as u32) << 2) | ((((inst >> 7) & 0x3) as u32) << 6);
+            let addr = rv(regs, 2).wrapping_add(off);
+            (
+                format!("c.swsp {}, {off}(sp)", xn(rs2)),
+                format!("store 4 byte(s) from {} to {addr:#010x}", regv(regs, rs2)),
+            )
+        }
+        _ => illegal,
+    }
+}
+
+pub fn disasm(inst: u32) -> String {
+    explain32(inst, 0, &[0; 32], &|_| 0, &|_, _| None).0
+}
+
 pub fn disasm_c(inst: u16) -> String {
-    format!("c.{inst:04x}")
+    explain_c(inst, 0, &[0; 32], &|_, _| None).0
 }
 
 #[cfg(test)]
@@ -978,5 +1757,41 @@ mod tests {
         assert!(!cpu.interrupts_enabled());
         cpu.step(&mut mem).unwrap();
         assert!(cpu.interrupts_enabled());
+    }
+
+    #[test]
+    fn explain_uses_current_register_values() {
+        let regs = [0u32; 32];
+        let (asm, effect) = explain32(0x0010_0093, 0x0800_0000, &regs, &|_| 0, &|_, _| None);
+        assert_eq!(asm, "addi ra, zero, 1");
+        assert!(effect.contains("ra = 0x1"), "{effect}");
+
+        let mut regs = [0u32; 32];
+        regs[1] = 7;
+        regs[2] = 0x2000_0000;
+        let (asm, effect) = explain32(0x0011_2023, 0x0800_0004, &regs, &|_| 0, &|_, _| None);
+        assert_eq!(asm, "sw ra, 0(sp)");
+        assert!(effect.contains("0x7"), "{effect}");
+        assert!(effect.contains("0x20000000"), "{effect}");
+
+        let mut mem_regs = [0u32; 32];
+        mem_regs[2] = 0x2000_0000;
+        let (asm, effect) = explain32(
+            0x0001_2083, // lw ra, 0(sp)
+            0x0800_0008,
+            &mem_regs,
+            &|_| 0,
+            &|addr, size| {
+                assert_eq!(addr, 0x2000_0000);
+                assert_eq!(size, 4);
+                Some(0x11)
+            },
+        );
+        assert_eq!(asm, "lw ra, 0(sp)");
+        assert!(effect.contains("ra = 0x11"), "{effect}");
+
+        let (asm, effect) = explain_c(0x4505, 0x0800_0000, &[0; 32], &|_, _| None);
+        assert_eq!(asm, "c.li a0, 1");
+        assert!(effect.contains("a0 = 0x1"), "{effect}");
     }
 }
